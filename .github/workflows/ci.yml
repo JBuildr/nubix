@@ -1,0 +1,26 @@
+# Nubix — build and unit-test the host (macOS) version on every push and pull request.
+# Copyright (C) 2026 Nubix contributors
+# SPDX-License-Identifier: GPL-3.0-only
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  host-macos:
+    name: Host build + tests (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies (Homebrew)
+        run: brew install cmake pkg-config sdl2 sdl2_ttf ffmpeg opus openssl@3
+
+      - name: Build and run unit tests
+        run: bash scripts/build-host.sh --test

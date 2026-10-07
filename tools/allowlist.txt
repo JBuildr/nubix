@@ -1,0 +1,11 @@
+# Extra domains the PS5 may reach through tools/sony_dns.py (one per line, '#' starts a comment).
+#
+# Everything Nubix needs is built into the script; you do NOT need to add anything to play.
+# Each entry also allows all of its subdomains ("example.com" allows "www.example.com").
+# Sony / PlayStation domains stay blocked even if you list them here.
+#
+# You are responsible for what you allow. Only add domains you know and trust.
+#
+# Examples (remove the leading '#' to enable):
+# youtube.com
+# googlevideo.com

@@ -1,0 +1,27 @@
+Nubix patch for libdatachannel v0.24.6: send RTCP PLI with sender SSRC 0.
+
+This patch is a Modification of libdatachannel
+(https://github.com/paullouisageneau/libdatachannel), which is licensed under
+the Mozilla Public License, v. 2.0. This patch is likewise licensed under the
+Mozilla Public License, v. 2.0 (see licenses/MPL-2.0.txt, or obtain a copy at
+https://mozilla.org/MPL/2.0/). The logic is taken from GreenOvercast
+(https://github.com/Producdevity/GreenOvercast, MPL-2.0, by Producdevity).
+SPDX-License-Identifier: MPL-2.0
+
+diff --git a/src/rtcpreceivingsession.cpp b/src/rtcpreceivingsession.cpp
+index 0584180..59a704b 100644
+--- a/src/rtcpreceivingsession.cpp
++++ b/src/rtcpreceivingsession.cpp
+@@ -179,7 +179,11 @@ bool RtcpReceivingSession::requestKeyframe(const message_callback &send) {
+ void RtcpReceivingSession::pushPLI(const message_callback &send) {
+ 	auto message = make_message(RtcpPli::Size(), Message::Control);
+ 	auto *pli = reinterpret_cast<RtcpPli *>(message->data());
+-	pli->preparePacket(mSsrc);
++	// Xbox (xCloud/xHome) ignores PLIs whose sender SSRC equals the media SSRC;
++	// browsers send sender SSRC 0 here. (nubix patch, from GreenOvercast)
++	pli->header.header.prepareHeader(206, 1, 2);
++	pli->header.setPacketSenderSSRC(0);
++	pli->header.setMediaSourceSSRC(mSsrc);
+ 	send(message);
+ }
+ 

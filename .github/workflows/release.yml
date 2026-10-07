@@ -1,0 +1,82 @@
+# Nubix — build the PS5 release on GitHub and publish it.
+#
+# Push a tag like v0.3.0 (it must match project(nubix VERSION ...) in CMakeLists.txt). The job
+# builds the PS5 homebrew zip inside the ps5dev Docker image, packs the GPL "Corresponding Source"
+# of everything linked into the binary, and attaches both to a GitHub release for that tag.
+# Started by hand (Actions tab -> Release -> Run workflow) it only builds and keeps the files as a
+# workflow artifact, without creating a release.
+# Copyright (C) 2026 Nubix contributors
+# SPDX-License-Identifier: GPL-3.0-only
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  ps5:
+    name: PS5 build + corresponding source
+    runs-on: ubuntu-24.04   # Docker is only available on Linux runners
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read version
+        id: ver
+        run: |
+          ver="$(sed -n 's/^project(nubix VERSION \([0-9.]*\).*/\1/p' CMakeLists.txt)"
+          [ -n "$ver" ] || { echo "version not found in CMakeLists.txt"; exit 1; }
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+          if [ "${GITHUB_REF_TYPE}" = "tag" ] && [ "${GITHUB_REF_NAME}" != "v$ver" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match CMakeLists.txt version v$ver"; exit 1
+          fi
+
+      - name: Point SOURCE.txt at this repository
+        run: sed -i "s#<owner>/nubix#${GITHUB_REPOSITORY}#g" SOURCE.txt
+
+      # First, while dist/ still belongs to the runner user (the Docker steps below write as root).
+      - name: Corresponding source bundle
+        run: bash scripts/make-source-bundle.sh
+
+      - name: Build libdatachannel for PS5
+        run: bash scripts/build-deps.sh ps5
+
+      - name: Build PS5 homebrew
+        run: bash scripts/build-ps5.sh
+
+      - name: Collect release files
+        run: |
+          sudo chown -R "$(id -u):$(id -g)" .
+          v="${{ steps.ver.outputs.version }}"
+          mkdir -p release
+          cp "build-ps5/nubix-v$v-websrv.zip" release/
+          cp "dist/nubix-v$v-corresponding-source.tar.xz" "dist/nubix-v$v-corresponding-source.MANIFEST" release/
+          (cd release && sha256sum * > SHA256SUMS.txt)
+          ls -la release
+
+      - name: Upload as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nubix-v${{ steps.ver.outputs.version }}
+          path: release/
+          retention-days: 14
+
+      - name: Publish GitHub release
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Nubix ${{ github.ref_name }}
+          prerelease: ${{ startsWith(steps.ver.outputs.version, '0.') }}
+          files: release/*
+          body: |
+            **Before your jailbroken PS5 goes online, block Sony's servers with a DNS server** (only Sony's domains, see the README section "Before you go online").
+
+            **Install:** download `nubix-${{ github.ref_name }}-websrv.zip`, unzip it and copy the `nubix` folder to `/data/homebrew/` on your PS5, then start **Nubix** from the websrv Homebrew Launcher. See the README for details.
+
+            `nubix-${{ github.ref_name }}-corresponding-source.tar.xz` is the complete source code of everything in the binary (GPL-3.0 requirement); you do not need it to use the app.
+
+            > Unofficial, non-commercial project. Not affiliated with Microsoft or Sony. Using third-party clients may violate their terms of service; use at your own risk.

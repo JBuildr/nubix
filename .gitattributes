@@ -1,0 +1,5 @@
+# Keep Unix line endings for everything that runs on Linux/macOS, even when committed from Windows.
+* text=auto eol=lf
+*.sh text eol=lf
+*.png binary
+*.ttf binary

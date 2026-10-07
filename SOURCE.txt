@@ -1,0 +1,152 @@
+Nubix - Source Code Offer / Corresponding Source
+=================================================
+
+Nubix is free software, licensed under the GNU General Public License, version 3
+only (GPL-3.0-only); see LICENSE. The PS5 binary (nubix.elf / homebrew package) is
+statically linked against the third-party libraries listed below. As required by
+section 6 of the GPLv3, the complete Corresponding Source for every binary release
+is published next to the binary, at the same place and at no further charge:
+
+    https://github.com/JBuildr/nubix/releases
+
+    Release asset:  nubix-v<version>-corresponding-source.tar.xz
+                    (e.g. nubix-v0.3.0-corresponding-source.tar.xz for Nubix 0.3.0)
+    Checksum:       nubix-v<version>-corresponding-source.tar.xz.sha256
+    Manifest:       nubix-v<version>-corresponding-source.MANIFEST
+
+The archive contains:
+  - nubix-v<version>-src.tar.xz : the Nubix source tree the binary was built from,
+    including patches/libdatachannel-*.patch, docker/Dockerfile, CMakeLists.txt,
+    cmake/ and scripts/ (the complete build and installation scripts);
+  - upstream/ : the unmodified upstream source of each library in the table below,
+    as release tarballs (sha256-verified against the pinned sums) or as
+    `git archive` exports of the exact commits;
+  - MANIFEST and SHA256SUMS : sha256 and size of every file in the archive.
+
+The archive is produced by scripts/make-source-bundle.sh (in the Nubix source).
+By default that script packages the current working tree
+(`git ls-files -co --exclude-standard`, i.e. tracked files including uncommitted
+changes plus non-ignored untracked files; docs/ is excluded), or a given git ref
+(--nubix-ref <ref>) or directory (--nubix-dir <dir>).
+
+
+How to rebuild the PS5 binary
+-----------------------------
+ 1. Build the toolchain image (Ubuntu 24.04 + clang/lld 18 + the prebuilt
+    ps5-payload-dev SDK and libraries from pacbrew-repo release v0.40.2):
+        docker build -t ps5dev docker/
+ 2. Build libdatachannel v0.24.6 (+ submodules), with patches/ applied:
+        scripts/build-deps.sh ps5
+    (set LDC_LOCAL_SRC=<dir> to use the libdatachannel sources from this archive
+    instead of cloning from GitHub; extract all libdatachannel/libjuice/libsrtp/
+    usrsctp/plog/json archives from upstream/ into one directory first.)
+ 3. Build Nubix:
+        scripts/build-ps5.sh
+    The result is written to build-ps5/.
+
+The libraries in /opt/ps5-payload-sdk inside the image were built by the
+ps5-payload-dev project from the PKGBUILD recipes in pacbrew-repo v0.40.2
+(included in upstream/) with the ps5-payload-sdk toolchain (also included). To
+rebuild one of them from the sources in this archive, use its PKGBUILD
+(directory named after the port, e.g. ffmpeg/, SDL2/, curl/) with the
+ps5-payload-sdk and pacbrew (makepkg) as described in pacbrew-repo/README.md,
+pointing source= at the tarball/export from upstream/.
+
+
+Components linked into the PS5 binary
+-------------------------------------
+Component          Version / commit                               License (SPDX)                     Upstream source
+-----------------  ---------------------------------------------  ---------------------------------  ---------------------------------------------------------------
+Nubix              0.3.0 (this release)                           GPL-3.0-only                       https://github.com/JBuildr/nubix
+nlohmann/json      bundled in third_party/ (Nubix source)         MIT                                https://github.com/nlohmann/json
+libdatachannel     v0.24.6  6b1e2e620f1e37f0eafeee702eaea0043cb305fd  MPL-2.0 (+ patches/ from Nubix)  https://github.com/paullouisageneau/libdatachannel
+  libjuice         v1.7.4   b89c792e3612faf2f12cf35bcc56857313a06be3  MPL-2.0                         https://github.com/paullouisageneau/libjuice
+  libsrtp          24b3bf8f19b6f5ab4cd2bcceb4f4064efca86fd5        BSD-3-Clause                       https://github.com/cisco/libsrtp
+  usrsctp          fec583d54493f879d2ae44a743423bf8a04371ab        BSD-3-Clause                       https://github.com/paullouisageneau/usrsctp
+  plog             94899e0b926ac1b0f4750bfbd495167b4a6ae9ef        MIT                                https://github.com/SergiusTheBest/plog
+  json (nlohmann)  55f93686c01528224f448c19128836e7df245f72        MIT                                https://github.com/nlohmann/json
+FFmpeg             7.0.1 (libavcodec, libavutil, libswresample)   GPL-3.0-or-later (--enable-gpl     https://ffmpeg.org/releases/ffmpeg-7.0.1.tar.xz
+                                                                   --enable-version3 --enable-libx264)
+x264               0.165.3222  b35605ace3ddf7c1a5d67a2eb553f034aef41d55  GPL-2.0-or-later         https://code.videolan.org/videolan/x264 (branch stable)
+libiconv           1.17                                           LGPL-2.1-or-later                  https://ftp.gnu.org/pub/gnu/libiconv/libiconv-1.17.tar.gz
+OpenSSL            3.5.2 (libssl, libcrypto)                      Apache-2.0                         https://github.com/openssl/openssl/releases/download/openssl-3.5.2/openssl-3.5.2.tar.gz
+curl (libcurl)     8.18.0                                         curl                               https://curl.se/download/curl-8.18.0.tar.xz
+libpsl             0.21.5                                         MIT                                https://github.com/rockdaboot/libpsl/releases/download/0.21.5/libpsl-0.21.5.tar.gz
+SDL2 (PS5 fork)    2.30.12, a47182a20e741e4735d1fcd41e8656bf338b0c72  Zlib                           https://github.com/ps5-payload-dev/SDL (branch release-2.30.x-ps5)
+SDL2_ttf           2.22.0                                         Zlib                               https://libsdl.org/projects/SDL_ttf/release/SDL2_ttf-2.22.0.tar.gz
+FreeType           2.13.2                                         FTL OR GPL-2.0-or-later            https://download.savannah.gnu.org/releases/freetype/freetype-2.13.2.tar.gz
+libpng             1.6.43                                         libpng-2.0                         https://download.sourceforge.net/libpng/libpng-1.6.43.tar.xz
+zlib               1.3.2                                          Zlib                               https://github.com/madler/zlib/releases/download/v1.3.2/zlib-1.3.2.tar.gz
+zstd               1.5.6                                          BSD-3-Clause OR GPL-2.0-only       https://github.com/facebook/zstd/releases/download/v1.5.6/zstd-1.5.6.tar.gz
+xz (liblzma)       5.4.6                                          public domain (liblzma 5.4.x)      https://github.com/tukaani-project/xz/releases/download/v5.4.6/xz-5.4.6.tar.xz
+bzip2              1.0.8                                          bzip2-1.0.6                        https://sourceware.org/pub/bzip2/bzip2-1.0.8.tar.gz
+openlibm (libm)    0.8.6                                          MIT AND BSD-2-Clause AND ISC       https://github.com/JuliaMath/openlibm/archive/refs/tags/v0.8.6.tar.gz
+Opus               1.5.2                                          BSD-3-Clause                       https://downloads.xiph.org/releases/opus/opus-1.5.2.tar.gz
+libsamplerate      0.2.2                                          BSD-2-Clause                       https://github.com/libsndfile/libsamplerate/releases/download/0.2.2/libsamplerate-0.2.2.tar.xz
+ps5-payload-sdk    4eb701204fc3f8d31e84cf8ca272974e2be9c867        GPL-3.0-or-later; include/freebsd  https://github.com/ps5-payload-dev/sdk
+                   (crt, libc/libpthread wrappers, headers,        under BSD licenses
+                   toolchain scripts)
+pacbrew-repo       v0.40.2  1687e827675c66e1b040751c7f0811222bd3aea0  GPL-3.0 (build recipes)      https://github.com/ps5-payload-dev/pacbrew-repo
+                   (PKGBUILD build scripts of every library above,
+                   incl. FFmpeg's ffplay-with-game-controller-input.diff)
+
+Not bundled (permissive license without a source-distribution requirement):
+LLVM runtimes      18.1.8 (libc++, libc++abi, libunwind; built     Apache-2.0 WITH LLVM-exception
+                   by ps5-payload-sdk libcxx.sh)
+    https://github.com/llvm/llvm-project/releases/download/llvmorg-18.1.8/llvm-project-18.1.8.src.tar.xz
+    sha256 0b58557a6d32ceee97c8d533a59b9212d87e0fc4d2833924eb6c611247db2f2a
+
+Not part of the Corresponding Source (GPLv3 section 1 "System Libraries" / generally
+available tools): the PS5 system modules the binary is dynamically linked to at
+runtime (libkernel, libSceLibcInternal, libSceNet, libSceVideoOut, libSceAudioOut,
+libScePad, libSceUserService, libSceSystemService, libSceImeDialog, libSceKeyboard, ...;
+the SDK only ships link stubs for them), and the compiler/linker used (clang/lld 18
+from Ubuntu 24.04, see docker/Dockerfile).
+
+
+Evidence for commits not pinned by a version tag
+------------------------------------------------
+pacbrew-repo v0.40.2 builds the SDK, the SDL2 fork and x264 from git branch heads
+(sha256sums=SKIP). The exact commits were determined from the prebuilt
+ps5-payload-dev.tar.gz of release v0.40.2 (as installed in the ps5dev image):
+
+* pacbrew-repo: tag v0.40.2 = commit 1687e82 (2026-08-18); the next commit on the
+  repository is dated 2026-08-30, i.e. after the build, so the recipes used are
+  exactly those of the tag. The release asset ps5-payload-dev.tar.gz was
+  (re)built 2026-08-23 ~14:18-16:11 UTC (file mtimes in the SDK: 2026-08-23 14:18 UTC;
+  asset upload 16:11:56 UTC; release note "rebuild with latest SDL2 port").
+
+* SDL2 PS5 fork: PROVEN. libSDL2.a contains the revision string
+  "SDL-2.30.12-ga47182a20" (SDL_GetRevision). Commit a47182a20e74... (2026-08-22,
+  "ps5: adjust remote control keyboard mappings") is on branch release-2.30.x-ps5;
+  the next commit is dated 2026-09-24, after the build.
+
+* x264: PROVEN. libx264.a contains "r3222 b35605a" (X264_POINTVER 0.165.3222) and
+  x264.pc reports Version 0.165.3222; the stable branch head is
+  b35605ace3ddf7c1a5d67a2eb553f034aef41d55 (abbreviation b35605a is unique).
+
+* ps5-payload-sdk: INFERRED, strongly supported. The SDK records no commit id. The
+  SDK's master branch at the build time (2026-08-23) was 4eb701204fc3 (2026-08-02,
+  "add support for firmware 13.60"); the next commit is 8e125899 (2026-08-28).
+  The installed crt1.o contains the firmware 13.60 offset added by 4eb7012
+  (data offsets 0x28C9E80, 0x0D9C064, 0x314B510, 0x2098228) and lacks kernel_iommu_* symbols introduced
+  by the 2026-08-28/29 commits; libc.a lacks killpg() (added 2026-09-03).
+  libc++/libc++abi/libunwind in the SDK are built by that commit's libcxx.sh from
+  LLVM 18.1.8.
+
+* Release tarballs: versions from the v0.40.2 PKGBUILDs (pkgver=) and cross-checked
+  against the installed pkg-config files (FreeType reports libtool version 26.1.20 =
+  2.13.2; openlibm.pc reports 0.8.0 because upstream's Make.inc in the v0.8.6
+  tag still says VERSION = 0.8.0 - the PKGBUILD pins v0.8.6 with sha256). The archive's tarballs are
+  verified against the sha256sums in those PKGBUILDs; FFmpeg's PKGBUILD has
+  sha256sums=SKIP, so its sum (bce9eeb0f17ef8982390b1f37711a61b4290dc8c2a0c1a37b5857e85bfb0e4ff)
+  was computed on download and recorded in the MANIFEST.
+
+* libdatachannel: v0.24.6 tag with the submodule commits recorded in that tag
+  (git submodule status of the build checkout). The Nubix patch
+  patches/libdatachannel-xbox-pli.patch is applied on top at build time.
+
+Written offer: if the release page is unavailable, anyone in possession of a Nubix
+binary may obtain the Corresponding Source by opening an issue at
+https://github.com/JBuildr/nubix/issues; this offer is valid for as long as the
+binary is distributed, and at least three years after the last distribution.
