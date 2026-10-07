@@ -55,8 +55,71 @@ jobs:
           mkdir -p release
           cp "build-ps5/nubix-v$v-websrv.zip" release/
           cp "dist/nubix-v$v-corresponding-source.tar.xz" "dist/nubix-v$v-corresponding-source.MANIFEST" release/
+          # Protective DNS (tools/sony_dns.py) as its own small download
+          mkdir -p "dns/nubix-dns-blocker"
+          cp tools/sony_dns.py tools/allowlist.txt LICENSE "dns/nubix-dns-blocker/"
+          cat > "dns/nubix-dns-blocker/README.txt" <<'TXT'
+          Nubix protective DNS for a jailbroken PS5
+          =========================================
+          Blocks everything except what Nubix needs for Xbox Cloud Gaming. Sony / PlayStation
+          domains are always blocked (no PSN, no system updates, no telemetry).
+
+          1. Install Python 3.8+ (python.org).
+          2. Start it on a PC in the same network as the PS5:
+               Windows (terminal "Run as administrator"):  python sony_dns.py
+               macOS / Linux:                              sudo python3 sony_dns.py
+             On Windows allow Python through the firewall for private networks.
+          3. On the PS5: Settings > Network > Settings > Set Up Internet Connection > your network >
+             Advanced Settings > DNS Settings: Manual > Primary DNS AND Secondary DNS = the IP the
+             script prints.
+          4. Keep the PC running while the PS5 is online.
+
+          More domains: add them to allowlist.txt (one per line). You are responsible for them.
+          See all queries: python sony_dns.py --log-all      Help: python sony_dns.py --help
+          TXT
+          (cd dns && python3 -m zipfile -c "../release/nubix-dns-blocker-v$v.zip" nubix-dns-blocker)
           (cd release && sha256sum * > SHA256SUMS.txt)
           ls -la release
+
+      - name: Write release notes
+        run: |
+          v="${{ steps.ver.outputs.version }}"
+          base="https://github.com/${GITHUB_REPOSITORY}/releases/download/v$v"
+          tree="https://github.com/${GITHUB_REPOSITORY}/blob/v$v"
+          cat > notes.md <<EOF
+          **Play Xbox Cloud Gaming online on your jailbroken PS5.** Unofficial, open-source client
+          that runs from the websrv Homebrew Launcher.
+
+          > [!WARNING]
+          > **Before your jailbroken PS5 goes online, protect it with a DNS that blocks Sony's servers**
+          > (PSN, system updates, telemetry). Use the **Nubix DNS blocker** below, or see
+          > [Before you go online]($tree/README.md#before-you-go-online-protective-dns) in the README.
+
+          ## Downloads
+
+          | | File | What it is |
+          |---|---|---|
+          | 🎮 | **[nubix-v$v-websrv.zip]($base/nubix-v$v-websrv.zip)** | The app. Copy the \`nubix\` folder to \`/data/homebrew/\` on the PS5. |
+          | 🛡️ | **[nubix-dns-blocker-v$v.zip]($base/nubix-dns-blocker-v$v.zip)** | Protective DNS for your PC (Python): allows only what Nubix needs, always blocks Sony. |
+          | 📦 | [nubix-v$v-corresponding-source.tar.xz]($base/nubix-v$v-corresponding-source.tar.xz) | Complete source of everything in the app (GPL-3.0). Not needed to play. |
+          | 🔒 | [SHA256SUMS.txt]($base/SHA256SUMS.txt) | Checksums of all files. |
+
+          ## Quick start
+
+          1. **Protect the console:** unzip \`nubix-dns-blocker-v$v.zip\` on a PC, run \`python sony_dns.py\`
+             (Windows: as administrator) and set the PS5's **Primary and Secondary DNS** to the IP it prints.
+          2. **Install:** unzip \`nubix-v$v-websrv.zip\` and copy the \`nubix\` folder to \`/data/homebrew/\` on the PS5.
+          3. **Start** websrv, open the Homebrew Launcher and start **Nubix**.
+          4. **Sign in:** open https://www.microsoft.com/link on your phone and enter the code shown on the TV.
+
+          Requires a Microsoft account with a Game Pass plan that includes cloud gaming (or the free,
+          ad-supported offering). Full guide, controls and troubleshooting: [README]($tree/README.md).
+
+          ---
+          > Unofficial, non-commercial project. Not affiliated with, endorsed by or sponsored by Microsoft
+          > or Sony. Using third-party clients may violate their terms of service; use at your own risk.
+          EOF
+          cat notes.md
 
       - name: Upload as workflow artifact
         uses: actions/upload-artifact@v4
@@ -72,11 +135,4 @@ jobs:
           name: Nubix ${{ github.ref_name }}
           prerelease: ${{ startsWith(steps.ver.outputs.version, '0.') }}
           files: release/*
-          body: |
-            **Before your jailbroken PS5 goes online, block Sony's servers with a DNS server** (only Sony's domains, see the README section "Before you go online").
-
-            **Install:** download `nubix-${{ github.ref_name }}-websrv.zip`, unzip it and copy the `nubix` folder to `/data/homebrew/` on your PS5, then start **Nubix** from the websrv Homebrew Launcher. See the README for details.
-
-            `nubix-${{ github.ref_name }}-corresponding-source.tar.xz` is the complete source code of everything in the binary (GPL-3.0 requirement); you do not need it to use the app.
-
-            > Unofficial, non-commercial project. Not affiliated with Microsoft or Sony. Using third-party clients may violate their terms of service; use at your own risk.
+          body_path: notes.md
