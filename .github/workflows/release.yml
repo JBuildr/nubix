@@ -128,6 +128,20 @@ jobs:
           path: release/
           retention-days: 14
 
+      # Re-running a tag (or moving it) must not collide with a release or draft from an earlier
+      # run: delete every release that uses this tag first. The git tag itself is kept.
+      - name: Remove earlier releases for this tag
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+            --jq ".[] | select(.tag_name == \"${GITHUB_REF_NAME}\") | .id" |
+          while read -r id; do
+            echo "deleting earlier release ${id}"
+            gh api -X DELETE "repos/${GITHUB_REPOSITORY}/releases/${id}"
+          done
+
       - name: Publish GitHub release
         if: github.ref_type == 'tag'
         uses: softprops/action-gh-release@v2
