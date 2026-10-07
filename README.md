@@ -12,6 +12,16 @@ to your TV with a DualSense as the controller.
 > Sony Interactive Entertainment. They are used here only to describe what this software works with.
 > Read [Disclaimer](#disclaimer) before you sign in.
 
+## Showcase
+
+<p align="center">
+  <a href="https://www.youtube.com/watch?v=N1xeoeBogxQ">
+    <img src="https://img.youtube.com/vi/N1xeoeBogxQ/maxresdefault.jpg" alt="Nubix showcase video on YouTube" width="720">
+  </a>
+  <br>
+  <sub>▶️ <a href="https://www.youtube.com/watch?v=N1xeoeBogxQ">Watch the showcase on YouTube</a>: sign-in, cloud library and gameplay on a jailbroken PS5.</sub>
+</p>
+
 ## Status
 
 | Area | State |
