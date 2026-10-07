@@ -1,6 +1,6 @@
-# Nubix
-
-**Play Xbox Cloud Gaming online on your jailbroken PS5.**
+<p align="center">
+  <img src=".github/assets/header.png" alt="Nubix - Play Xbox Cloud Gaming online on your jailbroken PS5" width="100%">
+</p>
 
 An **unofficial**, open-source client for **Xbox Cloud Gaming** on jailbroken PS5 consoles.
 It runs as a homebrew app (ELF payload) started from the
