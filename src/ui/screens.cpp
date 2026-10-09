@@ -225,7 +225,7 @@ std::vector<std::string> regionChoices(const Tokens& t) {
 
 const char* const kResolutions[] = {"720", "1080", "1080HQ"};
 
-enum Row { RowResolution, RowBitrate, RowRegion, RowF2p, RowDeadzone, RowStats, RowSignOut, RowExit, RowCount };
+enum Row { RowResolution, RowBitrate, RowRegion, RowF2p, RowDeadzone, RowVoice, RowStats, RowSignOut, RowExit, RowCount };
 
 }  // namespace
 
@@ -277,6 +277,7 @@ struct SettingsPanel::Impl {
             case RowRegion: return "Server region";
             case RowF2p: return "Free-to-play fallback";
             case RowDeadzone: return "Extra stick deadzone";
+            case RowVoice: return "Voice chat";
             case RowStats: return "Show stream statistics";
             case RowSignOut: return "Sign out";
             case RowExit: return "Exit Nubix";
@@ -307,6 +308,7 @@ struct SettingsPanel::Impl {
                 if (s.stickDeadzone <= 0) return "Off";
                 std::snprintf(buf, sizeof(buf), "%d %%", s.stickDeadzone);
                 return buf;
+            case RowVoice: return s.voiceChat ? "On" : "Off";
             case RowStats: return app.statsOverlay() ? "On" : "Off";
             default: return "";
         }
@@ -319,6 +321,9 @@ struct SettingsPanel::Impl {
             case RowRegion: return "Automatic uses the region Xbox assigns to your account.";
             case RowF2p: return "Retry with the free-to-play offering when a title is not in your Game Pass library.";
             case RowDeadzone: return "Ignore small stick movements (helps with drifting sticks).";
+            case RowVoice:
+                return "Use your headset or controller microphone for Xbox party and game chat. Applies to the next "
+                       "stream.";
             case RowStats: return "Resolution, frame rate, bitrate and decode time while streaming.";
             case RowSignOut: return "Forget the stored Microsoft account on this console.";
             case RowExit: return "Close the app.";
@@ -381,6 +386,11 @@ struct SettingsPanel::Impl {
                 save(app);
                 break;
             }
+            case RowVoice:
+                s.voiceChat = !s.voiceChat;
+                commit();
+                save(app);
+                break;
             case RowStats: app.setStatsOverlay(!app.statsOverlay()); break;
             case RowSignOut:
                 if (dir != 0) break;
@@ -421,7 +431,8 @@ bool SettingsPanel::onNav(App& app, NavKey key) {
 
 void SettingsPanel::render(App& app, Ui& ui, int top) {
     d_->refresh(app);
-    const int x = 360, w = 1200, h = 74, gap = 8;
+    // Row height keeps all rows, the help line and the account line above the hint bar (y 1022).
+    const int x = 360, w = 1200, h = 66, gap = 8;
     int y = top;
     for (int row = 0; row < RowCount; ++row) {
         const bool f = row == d_->focus;

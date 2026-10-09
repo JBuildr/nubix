@@ -1,4 +1,5 @@
-// Nubix — Opus audio: RTP -> libopus (48 kHz stereo) -> ring buffer -> SDL audio device.
+// Nubix — Opus audio: RTP -> libopus (48 kHz stereo) -> ring buffer -> SDL audio device,
+// plus an optional chat-voice stream mixed into the same output.
 // Copyright (C) 2026 Nubix contributors
 // SPDX-License-Identifier: GPL-3.0-only
 #pragma once
@@ -52,6 +53,24 @@ public:
         int bufferedMs = 0;
     };
     Stats stats() const;
+
+    // ---- chat / party voice (second SSRC) ----
+
+    // Separate chat/party voice stream (second SSRC): own Opus decoder (48 kHz stereo; mono
+    // payloads upmix in libopus), own ring (300 ms), prebuffer 40 ms, cap 120 ms (trim to 60 ms),
+    // no servo. Mixed into the game output in fill() with int32 sum + clamp to int16, before
+    // the mute check. lostBefore as in pushOpus(). Thread-safe.
+    void pushVoiceOpus(const uint8_t* opus, size_t n, int lostBefore = 0);
+    // Drop the voice ring and voice decoder state. Thread-safe. reset() also does this.
+    void resetVoice();
+    struct VoiceStats {
+        uint64_t packets = 0, lost = 0, droppedMs = 0;
+        int bufferedMs = 0;
+    };
+    VoiceStats voiceStats() const;
+
+    // dst[i] = clamp(dst[i] + src[i], INT16_MIN, INT16_MAX) for i in [0, n). Pure helper.
+    static void mixSaturate(int16_t* dst, const int16_t* src, int n);
 
 private:
     struct Impl;

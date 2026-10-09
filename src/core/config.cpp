@@ -144,6 +144,7 @@ bool Config::load() {
                 readStr(s, "locale", settings.locale);
                 readBool(s, "f2pFallback", settings.f2pFallback);
                 readInt(s, "stickDeadzone", settings.stickDeadzone);
+                readBool(s, "voiceChat", settings.voiceChat);
                 if (clampSettings(settings)) XC_LOGW("config: out-of-range settings were reset");
             }
             auto tIt = root.find("tokens");
@@ -259,6 +260,7 @@ bool Config::save() {
         {"resolution", settings.resolution}, {"bitrateKbps", settings.bitrateKbps},
         {"region", settings.region},         {"locale", settings.locale},
         {"f2pFallback", settings.f2pFallback}, {"stickDeadzone", settings.stickDeadzone},
+        {"voiceChat", settings.voiceChat},
     };
     root["tokens"] = {
         {"msaRefresh", tokens.msaRefresh},

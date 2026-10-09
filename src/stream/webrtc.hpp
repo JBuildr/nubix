@@ -1,4 +1,5 @@
-// Nubix — libdatachannel wrapper: recvonly H.264 + Opus tracks (mids "video", "audio"),
+// Nubix — libdatachannel wrapper: recvonly H.264 + Opus tracks (mids "video", "audio"; audio
+// becomes sendrecv with an own SSRC when voice chat is on and carries the microphone as RTP),
 // four reliable/ordered data channels (control/controlV1, input/1.0, message/messageV1,
 // chat/chatV1, created before the offer so the data m-line gets mid "0"), raw RTP delivery
 // and hand-built RTCP (PLI with sender SSRC 0, NACK, RR, REMB).
@@ -32,6 +33,11 @@ public:
         std::function<void(const std::string& ch)> onChannelOpen;
         // PeerConnection state changes: "new", "connecting", "connected", "disconnected", "failed", "closed".
         std::function<void(const std::string& state)> onState;
+        // RTP (header included) of a PT-111 audio stream whose SSRC is NOT the game audio SSRC
+        // (party/chat voice delivered as a separate stream). libdatachannel thread.
+        std::function<void(const uint8_t*, size_t)> onChatAudioRtp;
+        // Data channel ch closed (by either side). libdatachannel thread.
+        std::function<void(const std::string& ch)> onChannelClosed;
     };
 
     WebRtc();
@@ -40,7 +46,46 @@ public:
     WebRtc& operator=(const WebRtc&) = delete;
 
     // Create the PeerConnection, tracks and data channels. Must be called first.
-    bool init(const Callbacks& cb);
+    // voice=false: audio track RecvOnly without SSRC (the original layout).
+    // voice=true: audio track SendRecv announcing a microphone SSRC (random, != the RTCP sender
+    // SSRC) with cname / msid / track id (see micInfo()); proto::buildOffer(..., &mic) must be
+    // given the same values so the hand-written offer agrees with libdatachannel.
+    bool init(const Callbacks& cb, bool voice = false);
+
+    // Microphone send-stream identity. ssrc 0 = voice off.
+    struct MicInfo {
+        uint32_t ssrc = 0;
+        std::string cname, msid, trackId;
+    };
+    MicInfo micInfo() const;
+
+    // Send one Opus frame as RTP on the audio track: V=2, PT 111, M=marker, seq++ (random start),
+    // ts += samples48k after this packet (random start), SSRC = mic SSRC, no extensions/CSRC.
+    // Raw send (no media handler on the audio track). Also sends an RTCP SR (+SDES CNAME) for the
+    // mic SSRC at most once per 1000 ms. Thread-safe (own mutex, never takes the receive-callback
+    // lock). False if voice off, track not open, or the send failed.
+    bool sendMicOpus(const uint8_t* opus, size_t n, uint32_t samples48k, bool marker);
+
+    struct MicTxStats {
+        uint64_t packets = 0, bytes = 0, failed = 0;
+    };
+    MicTxStats micTxStats() const;
+
+    // Direction of mid "audio" in the last applied remote answer ("" before setRemote).
+    std::string answerAudioDirection() const;
+
+    // Chat renegotiation (worker thread only, after setRemote succeeded):
+    // begin: setLocalDescription(Offer) again on the stable PeerConnection; returns the ICE ufrag,
+    // pwd and fingerprint of the new local description (logs whether they equal the initial ones).
+    bool beginRenegotiation(std::string& ufrag, std::string& pwd, std::string& fingerprint);
+    // finish: setRemoteDescription(answer) (no new candidates). Updates routable PTs, answer
+    // SSRCs and answerAudioDirection(). False on failure (logged); call abortRenegotiation() then.
+    bool finishRenegotiation(const std::string& answerSdp);
+    // abort: roll back the pending local offer (no-op when none is pending).
+    void abortRenegotiation();
+
+    // SSRC currently treated as chat/party voice (0 = none seen).
+    uint32_t chatAudioSsrc() const;
 
     // Create the local offer, wait for ICE gathering (timeoutMs) and return the ICE credentials,
     // sha-256 fingerprint and gathered candidate lines ("candidate:..."). The real local
@@ -72,7 +117,8 @@ public:
     // Send RTCP REMB with the given max bitrate for the video SSRC.
     void sendRemb(uint32_t bps);
 
-    // Media SSRCs latched from the first received RTP packet (0 if none yet).
+    // Media SSRCs latched from the first received RTP packet (0 if none yet). audioSsrc() is the
+    // game audio SSRC (answer a=ssrc, else first PT-111 packet; see chatAudioSsrc()).
     uint32_t videoSsrc() const;
     uint32_t audioSsrc() const;
 
@@ -85,5 +131,9 @@ private:
     struct Impl;
     std::unique_ptr<Impl> d_;
 };
+
+// Pure helper (unit-tested): 12-byte RTP header (V=2, no padding/extension/CSRC) + payload.
+std::vector<uint8_t> buildOpusRtp(uint16_t seq, uint32_t ts, uint32_t ssrc, bool marker, const uint8_t* opus, size_t n,
+                                  uint8_t pt = 111);
 
 }  // namespace xc

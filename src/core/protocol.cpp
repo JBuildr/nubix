@@ -17,6 +17,7 @@
 #include <sys/socket.h>
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <random>
@@ -386,7 +387,7 @@ std::vector<std::string> expandTeredoCandidates(const std::vector<std::string>& 
 // ============================================================================================
 
 std::string buildOffer(const std::string& ufrag, const std::string& pwd, const std::string& fingerprint, bool home,
-                       const std::string& resolution) {
+                       const std::string& resolution, const OfferMic* mic, int sessionVersion) {
     const std::string u = trimmed(ufrag), p = trimmed(pwd);
     std::string fp = trimmed(fingerprint);
     if (startsWith(fp, "sha-256 ")) fp = trimmed(fp.substr(8));
@@ -406,7 +407,7 @@ std::string buildOffer(const std::string& ufrag, const std::string& pwd, const s
         s += "\r\n";
     };
     L("v=0");
-    L("o=- 4611731400430051 2 IN IP4 127.0.0.1");
+    L("o=- 4611731400430051 " + std::to_string(sessionVersion) + " IN IP4 127.0.0.1");
     L("s=-");
     L("t=0 0");
     L("a=group:BUNDLE video audio 0");
@@ -436,7 +437,20 @@ std::string buildOffer(const std::string& ufrag, const std::string& pwd, const s
     L("a=rtcp-rsize");
     L("a=rtpmap:111 opus/48000/2");
     L("a=fmtp:111 minptime=10;useinbandfec=1;stereo=1");
-    L("a=recvonly");
+    if (mic && mic->ssrc != 0) {
+        // Voice chat: the microphone goes up on this m-line (xbox.com adds its mic track to the
+        // audio transceiver the same way). Attribute order matches libdatachannel's addSSRC().
+        const std::string ssrc = std::to_string(mic->ssrc);
+        const std::string msid = trimmed(mic->msid);
+        const std::string track = trimmed(mic->trackId).empty() ? msid : trimmed(mic->trackId);
+        const std::string cname = trimmed(mic->cname).empty() ? std::string("xc") + ssrc : trimmed(mic->cname);
+        L("a=sendrecv");
+        if (!msid.empty()) L("a=msid:" + msid + " " + track);
+        L("a=ssrc:" + ssrc + " cname:" + cname);
+        if (!msid.empty()) L("a=ssrc:" + ssrc + " msid:" + msid + " " + track);
+    } else {
+        L("a=recvonly");
+    }
     // data channels (GreenOvercast; libdatachannel assigns the SCTP m-line mid "0")
     L("m=application 9 UDP/DTLS/SCTP webrtc-datachannel");
     L("c=IN IP4 0.0.0.0");
@@ -446,7 +460,7 @@ std::string buildOffer(const std::string& ufrag, const std::string& pwd, const s
     return s;
 }
 
-std::string sdpPostBody(const std::string& offer) {
+std::string sdpPostBody(const std::string& offer, bool chatStream) {
     json body = {
         {"messageType", "offer"},
         {"sdp", offer},
@@ -465,7 +479,98 @@ std::string sdpPostBody(const std::string& offer) {
           {"reliableinput", {{"minVersion", 9}, {"maxVersion", 9}}},
           {"unreliableinput", {{"minVersion", 9}, {"maxVersion", 9}}}}},
     };
+    // Media-stream chat (xbox.com ChatStreamManager): mic as RTP on the audio m-line.
+    if (chatStream) body["configuration"]["chatStream"] = {{"minVersion", 1}, {"maxVersion", 1}};
     return body.dump(-1, ' ', false, kReplace);
+}
+
+std::string sdpChatRenegotiationBody(const std::string& offer) {
+    json body = {
+        {"messageType", "offer"},
+        {"requestId", "2"},
+        {"sdp", offer},
+        {"configuration", {{"isMediaStreamsChatRenegotiation", true}}},
+    };
+    return body.dump(-1, ' ', false, kReplace);
+}
+
+namespace {
+
+// Integer value of an exchange field: numbers, bools and numeric strings; -1 otherwise.
+int exchangeInt(const json& obj, const char* key) {
+    auto it = obj.find(key);
+    if (it == obj.end()) return -1;
+    if (it->is_number_integer() || it->is_number_unsigned()) {
+        const long long v = it->get<long long>();
+        return v < -1 ? -1 : v > 0x7FFFFFFF ? 0x7FFFFFFF : static_cast<int>(v);
+    }
+    if (it->is_number_float()) {
+        const double v = it->get<double>();
+        return v != v || v < -1.0 ? -1 : v > 2147483647.0 ? 0x7FFFFFFF : static_cast<int>(v);
+    }
+    if (it->is_boolean()) return it->get<bool>() ? 1 : 0;
+    if (it->is_string()) {
+        const std::string t = trimmed(it->get<std::string>());
+        if (t.empty() || t.size() > 9) return -1;
+        for (char c : t)
+            if (c < '0' || c > '9') return -1;
+        return std::atoi(t.c_str());
+    }
+    return -1;
+}
+
+}  // namespace
+
+bool parseExchangeFields(const std::string& exchangeJson, SdpExchangeFields& out) {
+    out = SdpExchangeFields{};
+    json j = json::parse(exchangeJson, nullptr, false);
+    // exchangeResponse is normally a JSON *string* holding the object.
+    if (!j.is_discarded() && j.is_string()) j = json::parse(j.get<std::string>(), nullptr, false);
+    if (j.is_discarded() || !j.is_object()) return false;
+    auto sdpIt = j.find("sdp");
+    if (sdpIt != j.end() && sdpIt->is_string()) out.sdp = sdpIt->get<std::string>();
+    auto stIt = j.find("status");
+    if (stIt != j.end() && stIt->is_string()) out.status = stIt->get<std::string>();
+    out.chat = exchangeInt(j, "chat");
+    out.chatStream = exchangeInt(j, "chatStream");
+    json rest = j;
+    rest.erase("sdp");
+    out.summary = rest.dump(-1, ' ', false, kReplace);
+    if (out.summary.size() > 400) out.summary.resize(400);
+    return true;
+}
+
+std::string sdpMediaDirection(const std::string& sdp, const std::string& mid) {
+    std::istringstream in(sdp);
+    std::string line;
+    bool inMedia = false, match = false;
+    std::string dir;
+    while (std::getline(in, line)) {
+        line = trimmed(line);
+        if (startsWith(line, "m=")) {
+            if (match) break;
+            inMedia = true;
+            dir.clear();
+            continue;
+        }
+        if (!inMedia) continue;
+        if (startsWith(line, "a=mid:")) {
+            if (trimmed(line.substr(6)) == mid) match = true;
+        } else if (line == "a=sendrecv" || line == "a=sendonly" || line == "a=recvonly" || line == "a=inactive") {
+            dir = line.substr(2);
+        }
+    }
+    if (!match) return std::string();
+    return dir.empty() ? std::string("sendrecv") : dir;
+}
+
+std::string messageSetPartyChatActive(bool partyChatActive, const std::string& cv) {
+    return json{{"type", "TransactionStart"},
+                {"content", json{{"partyChatActive", partyChatActive}}.dump(-1, ' ', false, kReplace)},
+                {"id", newUuid()},
+                {"target", target::kSetPartyChatActive},
+                {"cv", cv}}
+        .dump(-1, ' ', false, kReplace);
 }
 
 std::string icePostBody(const std::vector<std::string>& candidates, const std::string& ufrag) {

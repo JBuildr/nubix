@@ -146,6 +146,7 @@ constexpr const char* kServerInitiatedDisconnect = "/streaming/sessionLifetimeMa
 constexpr const char* kShowMessageDialog = "/streaming/systemUi/messages/ShowMessageDialog";
 constexpr const char* kShowVirtualKeyboard = "/streaming/systemUi/messages/ShowVirtualKeyboard";
 constexpr const char* kTitleInfo = "/streaming/properties/titleinfo";
+constexpr const char* kSetPartyChatActive = "/streaming/social/partyChatAudioCoordination/setPartyChatActive";
 }  // namespace target
 
 // Parse a server->client input packet carrying a Vibration section. False if not vibration.
@@ -161,6 +162,14 @@ bool teredoDecode(const std::string& ipv6, std::string& ipv4, uint16_t& port);
 // prefix as the source line) come right before the original Teredo line, decoded port first.
 std::vector<std::string> expandTeredoCandidates(const std::vector<std::string>& candidates);
 
+// Microphone send-stream identity announced in the audio m-line (voice chat).
+struct OfferMic {
+    uint32_t ssrc = 0;       // != 0
+    std::string cname;       // e.g. "xc1a2b3c4d" (WebRtc::micInfo().cname)
+    std::string msid;        // stream id (uuid)
+    std::string trackId;     // track id (uuid)
+};
+
 // Hand-written browser-compatible offer (GreenOvercast buildCompatibleOffer / xCloud template):
 // BUNDLE video audio 0, H.264 profiles, Opus, data channel m-line mid 0, with the given ICE
 // credentials and sha-256 fingerprint ("AB:CD:..."). home selects xHome tweaks.
@@ -171,10 +180,44 @@ std::vector<std::string> expandTeredoCandidates(const std::vector<std::string>& 
 //   home (any):         profile-level-id=42e020;max-fs=3600;max-mbps=108000
 // and Opus PT 111 "minptime=10;useinbandfec=1;stereo=1". All lines CRLF. Returns "" if
 // ufrag, pwd or fingerprint is empty (a leading "sha-256 " on the fingerprint is stripped).
+//
+// mic == nullptr (or mic->ssrc == 0): audio m-line is recvonly, byte-identical to the original
+// template. mic != nullptr: the audio m-line carries, in this order (replacing "a=recvonly"):
+//   a=mid:audio / a=rtcp-mux / a=rtcp-rsize / a=rtpmap:111 opus/48000/2 /
+//   a=fmtp:111 minptime=10;useinbandfec=1;stereo=1 / a=sendrecv /
+//   a=msid:<msid> <trackId> / a=ssrc:<ssrc> cname:<cname> / a=ssrc:<ssrc> msid:<msid> <trackId>
+// (SSRC in decimal; an empty trackId falls back to msid, an empty msid omits the msid lines).
+// sessionVersion: number in "o=- 4611731400430051 <v> IN IP4 127.0.0.1" (initial 2, renegotiation 3).
 std::string buildOffer(const std::string& ufrag, const std::string& pwd, const std::string& fingerprint, bool home,
-                       const std::string& resolution);
+                       const std::string& resolution, const OfferMic* mic = nullptr, int sessionVersion = 2);
 // JSON body for POST /sdp: {"messageType":"offer","sdp":..., "requestId":"1","configuration":{...}}.
-std::string sdpPostBody(const std::string& offer);
+// chatStream=true additionally puts "chatStream":{"minVersion":1,"maxVersion":1} into configuration
+// (every other key unchanged, chatConfiguration kept); false gives the original body.
+std::string sdpPostBody(const std::string& offer, bool chatStream = false);
+// Second (chat media-stream renegotiation) offer, as xbox.com's ChatStreamManager posts it:
+// {"messageType":"offer","requestId":"2","sdp":<offer>,"configuration":{"isMediaStreamsChatRenegotiation":true}}.
+std::string sdpChatRenegotiationBody(const std::string& offer);
+
+// Fields of the parsed exchangeResponse object (gssv GET /sdp). Missing ints = -1.
+struct SdpExchangeFields {
+    std::string sdp;
+    std::string status;
+    int chat = -1;
+    int chatStream = -1;
+    std::string summary;  // exchange JSON re-dumped WITHOUT the "sdp" key (for logs), max 400 chars
+};
+// Parse an exchangeResponse (JSON text of the object, or JSON text of a string holding one).
+// False if unparsable / not an object. Numeric fields also accept bools and numeric strings.
+bool parseExchangeFields(const std::string& exchangeJson, SdpExchangeFields& out);
+
+// Direction attribute of the m-section with a=mid:<mid> in an SDP ("sendrecv","sendonly",
+// "recvonly","inactive"; "" if the mid is absent; "sendrecv" if the section has none).
+std::string sdpMediaDirection(const std::string& sdp, const std::string& mid);
+
+// Not used yet (party-client phase 2): message-channel TransactionStart for
+// /streaming/social/partyChatAudioCoordination/setPartyChatActive, content {"partyChatActive":b}.
+std::string messageSetPartyChatActive(bool partyChatActive, const std::string& cv = "");
+
 // JSON body for POST /ice (green-nx shape: stringified {candidate,sdpMid:"0",sdpMLineIndex:0,
 // usernameFragment} entries + end-of-candidates). Candidate lines may carry an "a=" prefix
 // and trailing CR/LF (both stripped); TCP candidates are skipped.

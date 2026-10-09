@@ -16,6 +16,8 @@
 //   input   — 125 Hz gamepad sender (contiguous sequence numbers)
 //   rtcp    — NACK flush (20 ms), RR + REMB + stats (1 s)
 //   keepalive — gssv /keepalive (per session), worker-stall watchdog
+//   voice   — VoiceChat capture thread (mic -> Opus -> WebRtc::sendMicOpus), per transport
+//   reneg   — voice chat renegotiation: gssv POST + poll of the second offer, posts an event
 // libdatachannel callbacks never block on anything the worker holds while
 // calling into WebRtc: they only push events, feed the depacketizer and the
 // audio player, or record rumble.
@@ -46,10 +48,12 @@ extern "C" {
 
 #include "core/http.hpp"
 #include "core/log.hpp"
+#include "platform/audio_in.hpp"  // complete type for VoiceChat's default source argument
 #include "platform/platform.hpp"
 #include "stream/audio.hpp"
 #include "stream/rtp.hpp"
 #include "stream/video.hpp"
+#include "stream/voice.hpp"
 #include "stream/webrtc.hpp"
 
 namespace xc {
@@ -91,6 +95,7 @@ constexpr int kRtcpTickMs = 20;                 // NACK flush cadence
 constexpr int kReportIntervalMs = 1000;         // RR + REMB + stats
 constexpr int kGatherTimeoutMs = 5000;          // local ICE gathering
 constexpr int kSdpAnswerTimeoutMs = 60000;      // green-nx: 120 polls x 500 ms
+constexpr int kSdpAnswerVoiceTimeoutMs = 30000; // voice offer: fall back without voice sooner
 constexpr int kRemoteIceTimeoutMs = 15000;      // green-nx gather deadline (home consoles: Teredo)
 constexpr int kRemoteIceCloudTimeoutMs = 4000;  // cloud: the first answer already carries usable candidates
 constexpr int kRemoteIcePollMs = 300;
@@ -114,6 +119,11 @@ constexpr int kQueueCapMs = 2 * 60 * 60 * 1000; // WaitingForResources: wait as 
 constexpr int kStateCapMs = 210000;             // any other gssv state that should move
 constexpr int kResumeStateCapMs = 30000;        // re-signal: give up on the old session quickly
 constexpr int kMaxPollErrors = 5;
+// Voice chat renegotiation (second offer, isMediaStreamsChatRenegotiation).
+constexpr int kRenegTimeoutMs = 10000;          // POST + answer, else abandoned (stream continues)
+constexpr int kRenegPollMs = 500;
+constexpr int kRenegMicWaitMs = 2000;           // after the handshake, wait this long for the mic before renegotiating
+constexpr int kChatLogInfoMessages = 5;         // chat channel traffic: first N at INFO, then DEBUG
 
 uint64_t nowMs() { return platform::monotonicMs(); }
 
@@ -215,11 +225,11 @@ struct Streamer::Impl {
     std::atomic<bool> serverEnded{false};
     std::string serverEndReason;            // statusMu
 
-    // ---- worker events (from libdatachannel callbacks) ----
+    // ---- worker events (from libdatachannel callbacks and the renegotiation thread) ----
     struct Event {
-        enum Type { ChannelOpen, Text, PcState } type;
+        enum Type { ChannelOpen, ChannelClose, Text, PcState, RenegResult } type;
         uint32_t gen;
-        std::string ch, text;
+        std::string ch, text;  // RenegResult: text = answer SDP ("" = failed), ch = failure reason
     };
     std::mutex evMu;
     std::condition_variable evCv;  // events + quit wakeups for the worker
@@ -250,6 +260,36 @@ struct Streamer::Impl {
     RtpOpusReceiver audioRx;     // internally locked
     std::mutex audioDrainMu;     // keeps pop -> pushOpus in order across threads
     std::vector<uint8_t> audioScratch;  // audioDrainMu
+    // Party / chat voice delivered as its own SSRC (WebRtc onChatAudioRtp): separate reorder
+    // window + RR statistics, played through AudioPlayer::pushVoiceOpus.
+    RtpOpusReceiver chatRx;             // internally locked
+    std::vector<uint8_t> chatScratch;   // audioDrainMu
+    std::atomic<uint64_t> chatRxPackets{0};  // per session
+
+    // ---- voice chat (microphone) ----
+    // The VoiceChat of the current transport (created at HandshakeAck, stopped before the
+    // PeerConnection closes). Readers (UI thread) copy the pointer under voiceMu.
+    mutable std::mutex voiceMu;
+    std::shared_ptr<VoiceChat> voice;
+    std::atomic<bool> micMuted{false};        // user preference, kept for the process lifetime
+    std::atomic<bool> voiceSessionOff{false}; // this session fell back to no voice (offer refused)
+    std::atomic<int> chatMsgs{0};             // chat data channel messages seen (log level)
+    // Per transport, worker thread only:
+    bool txVoice = false;                     // offer negotiated voice (sendrecv + chatStream)
+    bool txHome = false;
+    proto::OfferMic txMic;
+    std::string txInitialAnswer;
+    bool txMicAccepted = false;               // answer audio is sendrecv/recvonly (server takes our mic)
+    std::vector<std::string> txLocalCandidates;  // for the ICE exchange after the renegotiation
+    std::string txUfrag;
+    uint64_t renegDueAt = 0;                  // handshake time; mic Live/Muted wait ends kRenegMicWaitMs later
+    bool renegStarted = false;
+    bool renegNoChatLogged = false;
+    std::atomic<int> chatStreamVersion{-1};   // exchangeResponse.chatStream of the answer
+    std::atomic<bool> voiceRenegotiated{false};
+    // Renegotiation POST/poll thread (never touches WebRtc; reports through an event).
+    std::thread renegThr;
+    std::atomic<bool> renegAbort{false};
 
     // ---- counters ----
     std::atomic<uint64_t> videoBytes{0};
@@ -385,10 +425,11 @@ struct Streamer::Impl {
             if (video) {
                 std::lock_guard<std::mutex> lk(depackMu);
                 depack.stats().onSenderReport(ntp);
+            } else if (ssrc != 0 && ssrc == chatRx.ssrc()) {
+                chatRx.stats().onSenderReport(ntp);  // separate party/chat voice stream
             } else {
                 audioRx.stats().onSenderReport(ntp);
             }
-            (void)ssrc;
         };
         cb.onText = [this, gen](const std::string& ch, const std::string& text) {
             if (gen != rtcGen.load()) return;
@@ -402,6 +443,11 @@ struct Streamer::Impl {
             if (gen != rtcGen.load()) return;
             pushEvent(Event{Event::ChannelOpen, gen, ch, std::string()});
         };
+        cb.onChannelClosed = [this, gen](const std::string& ch) {
+            if (gen != rtcGen.load()) return;
+            pushEvent(Event{Event::ChannelClose, gen, ch, std::string()});
+        };
+        cb.onChatAudioRtp = [this, gen](const uint8_t* d, size_t n) { onChatAudioRtp(gen, d, n); };
         cb.onState = [this, gen](const std::string& s) {
             if (gen != rtcGen.load()) return;
             pcConnected = (s == "connected");
@@ -483,11 +529,49 @@ struct Streamer::Impl {
         int lostBefore = 0;
         while (audioRx.pop(audioScratch, ts, lostBefore))
             if (audioOk) audio.pushOpus(audioScratch.data(), audioScratch.size(), lostBefore);
+        drainChatLocked();
+    }
+
+    // Second PT-111 SSRC (party / chat voice as its own stream): mixed into the output.
+    void onChatAudioRtp(uint32_t gen, const uint8_t* d, size_t n) {
+        if (gen != rtcGen.load()) return;
+        std::lock_guard<std::mutex> lk(audioDrainMu);
+        if (n >= 12) {
+            // WebRtc replaces the chat SSRC only after the old one went quiet: start the
+            // reorder window and the voice decoder fresh instead of waiting for the latch.
+            const uint32_t ssrc = (uint32_t(d[8]) << 24) | (uint32_t(d[9]) << 16) | (uint32_t(d[10]) << 8) | d[11];
+            const uint32_t prev = chatRx.ssrc();
+            if (prev != 0 && prev != ssrc) {
+                chatRx.reset();
+                if (audioOk) audio.resetVoice();
+            }
+        }
+        chatRx.push(d, n);
+        drainChatLocked();
+    }
+
+    // Caller holds audioDrainMu.
+    void drainChatLocked() {
+        uint32_t ts = 0;
+        int lostBefore = 0;
+        while (chatRx.pop(chatScratch, ts, lostBefore)) {
+            if (!audioOk) continue;
+            audio.pushVoiceOpus(chatScratch.data(), chatScratch.size(), lostBefore);
+            chatRxPackets++;
+        }
     }
 
     // Server -> client input-channel reports (rumble, server metadata). Runs on a
     // libdatachannel thread; only touches its own small locks.
     void onBinary(const std::string& ch, const uint8_t* d, size_t n) {
+        if (ch == "chat") {
+            // Logged only (voice goes over RTP); nothing is ever sent on this channel.
+            if (chatMsgs.fetch_add(1) < kChatLogInfoMessages)
+                XC_LOGI("recv [chat] %zu binary bytes", n);
+            else
+                XC_LOGD("recv [chat] %zu binary bytes", n);
+            return;
+        }
         if (ch != "input") {
             XC_LOGD("recv [%s] %zu binary bytes", ch.c_str(), n);
             return;
@@ -646,6 +730,8 @@ struct Streamer::Impl {
     void rtcpLoop() {
         uint64_t lastReport = nowMs();
         uint64_t prevBytes = videoBytes.load(), prevFrames = framesDecoded.load();
+        uint64_t prevMicBytes = 0;
+        const WebRtc* prevMicRtc = nullptr;
         while (!quit && !workerDone) {
             std::this_thread::sleep_for(std::chrono::milliseconds(kRtcpTickMs));
             std::shared_ptr<WebRtc> r = currentRtc();
@@ -677,10 +763,24 @@ struct Streamer::Impl {
                 vc = depack.counters();
             }
             RtpReceiveStats a = audioRx.stats().snapshotForReport();
+            RtpReceiveStats c;
+            if (chatRx.ssrc() != 0) c = chatRx.stats().snapshotForReport();
+            int micKbps = 0;
+            if (r) {
+                const WebRtc::MicTxStats mt = r->micTxStats();
+                // A new transport restarts its counters: no delta across PeerConnections.
+                if (r.get() != prevMicRtc || mt.bytes < prevMicBytes) {
+                    prevMicRtc = r.get();
+                    prevMicBytes = mt.bytes;
+                }
+                if (dt > 0) micKbps = static_cast<int>(static_cast<double>(mt.bytes - prevMicBytes) * 8.0 / 1000.0 / dt);
+                prevMicBytes = mt.bytes;
+            }
             if (r) {
                 std::vector<RtpReceiveStats> blocks;
                 if (v.ssrc && v.packets) blocks.push_back(v);
                 if (a.ssrc && a.packets) blocks.push_back(a);
+                if (c.ssrc && c.packets) blocks.push_back(c);
                 if (!blocks.empty()) r->sendReceiverReport(blocks);
                 if (r->videoSsrc()) r->sendRemb(static_cast<uint32_t>(settings.bitrateKbps) * 1000u);
             }
@@ -697,6 +797,10 @@ struct Streamer::Impl {
             s.lossPercent = v.fractionLost * 100.0 / 256.0;
             s.rttMs = vc.rttMs ? static_cast<int>(vc.rttMs) : -1;  // NACK round-trip estimate
             s.audioBufferMs = audioOk ? audio.bufferedMs() : 0;
+            s.voiceNegotiated = chatStreamVersion.load() >= 1;
+            s.voiceRenegotiated = voiceRenegotiated.load();
+            s.micTxKbps = micKbps;
+            s.chatRxPackets = chatRxPackets.load();
             prevBytes = bytes;
             prevFrames = frames;
             {
@@ -784,8 +888,24 @@ struct Streamer::Impl {
         {
             std::lock_guard<std::mutex> lk(audioDrainMu);
             audioRx.reset();
+            chatRx.reset();
         }
-        if (audioOk) audio.reset();  // new transport: fresh RTP sequence + Opus state
+        if (audioOk) {
+            audio.reset();  // new transport: fresh RTP sequence + Opus state
+            audio.resetVoice();
+        }
+        txVoice = false;
+        txMic = proto::OfferMic();
+        txInitialAnswer.clear();
+        txMicAccepted = false;
+        txLocalCandidates.clear();
+        txUfrag.clear();
+        renegDueAt = 0;
+        renegStarted = false;
+        renegNoChatLogged = false;
+        chatStreamVersion = -1;
+        voiceRenegotiated = false;
+        chatMsgs = 0;
         {
             std::lock_guard<std::mutex> lk(evMu);
             events.clear();
@@ -801,9 +921,29 @@ struct Streamer::Impl {
         padDirty = true;
     }
 
+    // Stop the microphone and the renegotiation thread of the current transport. Runs before
+    // every PeerConnection close (closePeer) so neither sends into a closing WebRtc. Called on
+    // the worker or (after the worker joined) the lifecycle thread, never on the capture or
+    // renegotiation thread itself (it joins them).
+    void stopVoice() {
+        std::shared_ptr<VoiceChat> v;
+        {
+            std::lock_guard<std::mutex> lk(voiceMu);
+            v = std::move(voice);
+            voice.reset();
+        }
+        if (v) {
+            v->stop();
+            XC_LOGI("voice: microphone stopped");
+        }
+        renegAbort = true;
+        if (renegThr.joinable()) renegThr.join();
+    }
+
     // Detach and close the current PeerConnection. Callbacks of the old generation are
     // ignored from here on; close() is called without holding any of our locks.
     void closePeer() {
+        stopVoice();
         std::shared_ptr<WebRtc> old;
         {
             std::lock_guard<std::mutex> lk(rtcMu);
@@ -840,7 +980,32 @@ struct Streamer::Impl {
                 rx && now >= rx ? (std::to_string((now - rx) / 1000) + "s ago").c_str() : "never");
     }
 
-    void afterHandshakeAck(WebRtc& r) {
+    // Start the microphone for transport gen (voice negotiated in the offer). The sink runs on
+    // the capture thread: it sends through the current WebRtc unless the transport changed.
+    void startVoice(uint32_t gen) {
+        if (currentVoice()) return;  // already running for this transport
+        auto v = std::make_shared<VoiceChat>();
+        VoiceChat::FrameSink sink = [this, gen](const uint8_t* opus, size_t n, uint32_t samples48k, bool marker) {
+            if (gen != rtcGen.load()) return;
+            std::shared_ptr<WebRtc> r = currentRtc();
+            if (r) r->sendMicOpus(opus, n, samples48k, marker);
+        };
+        const bool muted = micMuted.load();
+        if (!v->start(std::move(sink), muted)) {
+            XC_LOGW("voice: microphone thread could not be started, streaming without voice chat");
+            return;
+        }
+        XC_LOGI("voice: microphone starting (%s)", muted ? "muted" : "live");
+        std::lock_guard<std::mutex> lk(voiceMu);
+        voice = std::move(v);
+    }
+
+    std::shared_ptr<VoiceChat> currentVoice() const {
+        std::lock_guard<std::mutex> lk(voiceMu);
+        return voice;
+    }
+
+    void afterHandshakeAck(WebRtc& r, uint32_t gen) {
         sendText(r, "control", proto::controlAuthorization());
         sendText(r, "control", proto::controlGamepadChanged(0, true));
         // Pin the resolution; without it servers pick 1440p for desktop-class clients.
@@ -860,6 +1025,14 @@ struct Streamer::Impl {
         // Ask for an IDR right away (PLI + control) instead of waiting for the periodic one.
         requestKeyframeInternal(true);
         XC_LOGI("handshake complete, capabilities sent");
+        if (txVoice && txMicAccepted)
+            startVoice(gen);
+        else if (txVoice)
+            XC_LOGI("voice: microphone stays off (server did not accept it on this connection)");
+        else if (!settings.voiceChat)
+            XC_LOGI("voice: disabled in settings");
+        else
+            XC_LOGI("voice: not negotiated for this connection, microphone stays off");
     }
 
     // Returns true if the session must end (server disconnect).
@@ -949,7 +1122,10 @@ struct Streamer::Impl {
             Impl* self;
             ~Closer() { self->closePeer(); }
         } closer{this};
-        if (!r->init(makeCallbacks(gen))) {
+        // Voice chat: the audio m-line goes sendrecv with our mic SSRC and the POST asks for
+        // chatStream. Off (setting, or this session fell back): byte-identical to before.
+        const bool voiceWanted = settings.voiceChat && !voiceSessionOff.load();
+        if (!r->init(makeCallbacks(gen), voiceWanted)) {
             fail("Failed to create the WebRTC connection");
             return PeerOutcome::Finished;
         }
@@ -970,11 +1146,32 @@ struct Streamer::Impl {
         if (quit) return PeerOutcome::Finished;
         XC_LOGI("gathered %zu local candidates (ufrag %s)", local.size(), ufrag.c_str());
         for (const auto& c : local) XC_LOGD("  local  cand: %s", c.c_str());
-        std::string offer = proto::buildOffer(ufrag, pwd, fingerprint, home, settings.resolution);
+        txHome = home;
+        txVoice = false;
+        if (voiceWanted) {
+            const WebRtc::MicInfo mi = r->micInfo();
+            if (mi.ssrc != 0) {
+                txMic.ssrc = mi.ssrc;
+                txMic.cname = mi.cname;
+                txMic.msid = mi.msid;
+                txMic.trackId = mi.trackId;
+                txVoice = true;
+            } else {
+                XC_LOGW("voice: no microphone send stream on the peer connection, offering without voice chat");
+            }
+        }
+        std::string offer =
+            proto::buildOffer(ufrag, pwd, fingerprint, home, settings.resolution, txVoice ? &txMic : nullptr, 2);
         XC_LOGD("offer sdp:\n%s", offer.c_str());
 
         // ---- SDP exchange ----
-        if (!gssv.sendSdpOffer(s, offer, err)) {
+        if (!gssv.sendSdpOffer(s, offer, err, txVoice)) {
+            if (txVoice && !quit) {
+                // Never let voice chat cost the stream: renegotiate this session without it.
+                XC_LOGW("voice: offer with voice chat refused (%s), retrying without voice chat", err.c_str());
+                voiceSessionOff = true;
+                return resuming ? PeerOutcome::RetryFresh : PeerOutcome::Resignal;
+            }
             if (resuming) {
                 XC_LOGW("re-signal refused (sdp): %s", err.c_str());
                 return PeerOutcome::RetryFresh;
@@ -984,12 +1181,24 @@ struct Streamer::Impl {
         }
         std::string answer;
         {
-            uint64_t deadline = nowMs() + kSdpAnswerTimeoutMs;
+            // With voice chat offered, give up on the answer sooner: the fallback without voice
+            // then still has the rest of the user's patience.
+            uint64_t deadline = nowMs() + (txVoice ? kSdpAnswerVoiceTimeoutMs : kSdpAnswerTimeoutMs);
             bool ready = false;
+            bool rejected = false;
             int errors = 0;
+            SdpAnswerInfo info;
+            err.clear();
             while (!quit && !ready) {
-                if (!gssv.pollSdpAnswer(s, answer, ready, err)) {
+                if (gssv.pollSdpAnswer(s, info, ready, err)) {
+                    answer = info.sdp;
+                } else {
                     XC_LOGW("sdp poll failed: %s", err.c_str());
+                    // The server refused the exchange itself: polling again will not change it.
+                    if (info.rejected) {
+                        rejected = true;
+                        break;
+                    }
                     if (++errors >= kMaxPollErrors) break;
                 }
                 if (ready) break;
@@ -998,11 +1207,24 @@ struct Streamer::Impl {
             }
             if (quit) return PeerOutcome::Finished;
             if (!ready || answer.empty()) {
+                // Never let voice chat cost the stream: a refused exchange or no answer to the
+                // voice offer is retried once without voice chat (as for a refused POST above).
+                if (txVoice) {
+                    XC_LOGW("voice: no usable SDP answer to the voice chat offer (%s%s), retrying without voice chat",
+                            rejected ? "refused: " : "", err.empty() ? "timeout" : err.c_str());
+                    voiceSessionOff = true;
+                    return resuming ? PeerOutcome::RetryFresh : PeerOutcome::Resignal;
+                }
                 if (resuming) return PeerOutcome::RetryFresh;
                 fail(err.empty() ? "Timed out waiting for the SDP answer" : "SDP exchange failed: " + err);
                 return PeerOutcome::Finished;
             }
+            chatStreamVersion = info.chatStream;
+            XC_LOGI("voice: answer chat=%d chatStream=%d", info.chat, info.chatStream);
         }
+        txInitialAnswer = answer;
+        txLocalCandidates = local;
+        txUfrag = ufrag;
         XC_LOGI("answer received (%zu bytes)", answer.size());
         XC_LOGD("answer sdp:\n%s", answer.c_str());
 
@@ -1052,14 +1274,168 @@ struct Streamer::Impl {
         if (expanded.size() != remote.size())
             for (const auto& c : expanded) XC_LOGD("  expanded cand: %s", c.c_str());
         if (!r->setRemote(answer, expanded)) {
+            if (txVoice && !quit) {
+                XC_LOGW("voice: answer to the voice chat offer could not be applied, retrying without voice chat");
+                voiceSessionOff = true;
+                return resuming ? PeerOutcome::RetryFresh : PeerOutcome::Resignal;
+            }
             fail("The server's SDP answer could not be applied");
             return PeerOutcome::Finished;
         }
+        if (txVoice) {
+            // The answer's direction is the server's view: sendonly/inactive = it will not take our mic.
+            const std::string dir = r->answerAudioDirection();
+            txMicAccepted = dir == "sendrecv" || dir == "recvonly";
+            XC_LOGI("voice: negotiated=%s audio=%s mic=%s", chatStreamVersion.load() >= 1 ? "yes" : "no",
+                    dir.empty() ? "?" : dir.c_str(), txMicAccepted ? "accepted" : "refused");
+            if (!txMicAccepted)
+                XC_LOGW("voice: server answered audio %s, microphone not accepted", dir.empty() ? "(none)" : dir.c_str());
+        }
         XC_LOGI("remote description set, checking connectivity");
-        return eventLoop(*r, gen);
+        return eventLoop(gssv, s, *r, gen);
     }
 
-    PeerOutcome eventLoop(WebRtc& r, uint32_t gen) {
+    // ===================== voice chat renegotiation =====================
+
+    // Worker: the chat renegotiation is due once the server offered chatStream, the handshake
+    // is done and the microphone is open (official ChatStreamManager.enable()). Once per
+    // transport; any failure leaves the mic on the initial sendrecv audio line.
+    void maybeStartRenegotiation(GssvClient& gssv, const SessionInfo& s, WebRtc& r, uint32_t gen) {
+        if (!txVoice || !txMicAccepted || !handshakeDone || renegStarted) return;
+        // Party voice is received over the chat stream whether or not our mic works, so a mic
+        // failure only delays the renegotiation (at most kRenegMicWaitMs), it never blocks it.
+        const uint64_t now = nowMs();
+        if (!renegDueAt) renegDueAt = now;
+        std::shared_ptr<VoiceChat> v = currentVoice();
+        const VoiceChat::State vs = v ? v->state() : VoiceChat::State::Unavailable;
+        const bool micReady = vs == VoiceChat::State::Live || vs == VoiceChat::State::Muted;
+        if (!micReady && now - renegDueAt < static_cast<uint64_t>(kRenegMicWaitMs)) return;
+        const int cs = chatStreamVersion.load();
+        if (cs < 1) {
+            if (!renegNoChatLogged) {
+                renegNoChatLogged = true;
+                XC_LOGI("voice: server did not negotiate chatStream, sending mic on initial audio line only");
+            }
+            return;
+        }
+        renegStarted = true;
+        XC_LOGI("voice: renegotiation start (chatStream=%d, mic %s)", cs, v ? voiceStateName(vs) : "none");
+        std::string u, p, fp;
+        if (!r.beginRenegotiation(u, p, fp)) {
+            r.abortRenegotiation();  // roll back a local offer that was set but is unusable (no-op otherwise)
+            XC_LOGW("voice: renegotiation failed: no local offer");
+            return;
+        }
+        const std::string offer2 = proto::buildOffer(u, p, fp, txHome, settings.resolution, &txMic, 3);
+        XC_LOGD("renegotiation offer sdp:\n%s", offer2.c_str());
+        if (renegThr.joinable()) renegThr.join();  // a finished thread of an earlier transport
+        renegAbort = quit.load();
+        const std::string initial = txInitialAnswer;
+        const std::vector<std::string> cands = txLocalCandidates;
+        const std::string iceUfrag = u.empty() ? txUfrag : u;
+        try {
+            renegThr = std::thread([this, &gssv, s, offer2, initial, cands, iceUfrag, gen] {
+                try {
+                    renegotiate(gssv, s, offer2, initial, cands, iceUfrag, gen);
+                } catch (const std::exception& e) {
+                    XC_LOGW("voice: renegotiation thread: %s", e.what());
+                    pushEvent(Event{Event::RenegResult, gen, std::string("failed: ") + e.what(), std::string()});
+                }
+            });
+        } catch (const std::exception& e) {
+            XC_LOGW("voice: renegotiation failed: cannot start thread (%s)", e.what());
+            r.abortRenegotiation();
+        }
+    }
+
+    // Renegotiation thread: POST the second offer, poll for its answer (bounded), report.
+    // Only gssv calls (GssvClient is safe to share across threads) and the event queue.
+    void renegotiate(GssvClient& gssv, const SessionInfo& s, const std::string& offer, const std::string& initial,
+                     const std::vector<std::string>& cands, const std::string& iceUfrag, uint32_t gen) {
+        Http::AbortScope abortOn(&renegAbort);
+        const uint64_t start = nowMs();
+        auto stopped = [this] { return quit.load() || renegAbort.load(); };
+        auto report = [&](const std::string& why, const std::string& answer) {
+            if (!stopped()) pushEvent(Event{Event::RenegResult, gen, why, answer});
+        };
+        std::string err;
+        if (!gssv.sendSdpRenegotiation(s, offer, err)) {
+            report("failed: " + (err.empty() ? std::string("offer refused") : err), std::string());
+            return;
+        }
+        const uint64_t posted = nowMs();
+        XC_LOGI("voice: renegotiation offer posted");
+        int errors = 0;
+        bool sawInitial = false;
+        while (!stopped()) {
+            // sleep in short steps so a teardown never waits for a whole poll interval
+            for (int waited = 0; waited < kRenegPollMs && !stopped(); waited += 50)
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            if (stopped()) return;
+            SdpAnswerInfo info;
+            bool ready = false;
+            if (!gssv.pollSdpAnswer(s, info, ready, err)) {
+                XC_LOGD("voice: renegotiation poll failed: %s", err.c_str());
+                if (++errors >= kMaxPollErrors) {
+                    report("failed: " + err, std::string());
+                    return;
+                }
+            } else if (ready && !info.sdp.empty()) {
+                // GET /sdp keeps returning the initial answer until the second one exists; that
+                // is never the reply to this offer (xbox.com keeps polling too).
+                if (info.sdp == initial) {
+                    sawInitial = true;
+                } else {
+                    XC_LOGI("voice: renegotiation answer received (%zu bytes, %llu ms)", info.sdp.size(),
+                            static_cast<unsigned long long>(nowMs() - posted));
+                    // xbox.com re-runs the ICE exchange after every answer, the chat renegotiation
+                    // included (same candidates and ufrag). Its outcome never decides the result.
+                    if (!cands.empty() && !stopped()) {
+                        std::string iceErr;
+                        bool iceOk = gssv.sendIce(s, cands, iceUfrag, iceErr);
+                        if (iceOk && !stopped()) {
+                            std::vector<std::string> got;
+                            bool iceReady = false;
+                            iceOk = gssv.pollIce(s, got, iceReady, iceErr);
+                            if (iceOk) XC_LOGD("voice: renegotiation ice poll: %zu candidates", got.size());
+                        }
+                        if (iceOk)
+                            XC_LOGI("voice: renegotiation ice exchange ok");
+                        else
+                            XC_LOGW("voice: renegotiation ice exchange failed: %s", iceErr.c_str());
+                    }
+                    report(std::string(), info.sdp);
+                    return;
+                }
+            }
+            if (nowMs() - start >= static_cast<uint64_t>(kRenegTimeoutMs)) {
+                report(sawInitial ? "timed out (server returned only the initial answer)" : "timed out", std::string());
+                return;
+            }
+        }
+    }
+
+    // Worker: apply (or abandon) the renegotiation answer. Never ends the stream.
+    void finishRenegotiation(WebRtc& r, const Event& ev) {
+        if (renegThr.joinable()) renegThr.join();  // it posted this event as its last action
+        if (!ev.text.empty()) {
+            if (r.finishRenegotiation(ev.text)) {
+                voiceRenegotiated = true;
+                XC_LOGI("voice: renegotiation ok");
+                return;
+            }
+            r.abortRenegotiation();
+            XC_LOGW("voice: renegotiation failed: answer could not be applied");
+            return;
+        }
+        r.abortRenegotiation();
+        if (ev.ch.rfind("timed out", 0) == 0)
+            XC_LOGW("voice: renegotiation %s", ev.ch.c_str());
+        else
+            XC_LOGW("voice: renegotiation %s", ev.ch.c_str());
+    }
+
+    PeerOutcome eventLoop(GssvClient& gssv, const SessionInfo& sess, WebRtc& r, uint32_t gen) {
         const uint64_t negotiationStart = nowMs();
         uint64_t connectedAt = 0, disconnectedAt = 0, handshakeAt = 0, ackAt = 0;
         uint64_t lastSecond = nowMs(), lastLoop = nowMs();
@@ -1106,6 +1482,12 @@ struct Streamer::Impl {
                     case Event::ChannelOpen:
                         XC_LOGI("data channel open: %s", ev.ch.c_str());
                         break;
+                    case Event::ChannelClose:
+                        XC_LOGI("data channel closed: %s", ev.ch.c_str());
+                        break;
+                    case Event::RenegResult:
+                        finishRenegotiation(r, ev);
+                        break;
                     case Event::Text:
                         if (ev.ch == "message") {
                             XC_LOGD("recv [message] %s", preview(ev.text).c_str());
@@ -1117,7 +1499,11 @@ struct Streamer::Impl {
                                 setStatus("Starting the stream...");
                             }
                         } else if (ev.ch == "chat") {
-                            // chat audio is not supported
+                            // Voice runs over RTP; the chat channel is only logged, never written.
+                            if (chatMsgs.fetch_add(1) < kChatLogInfoMessages)
+                                XC_LOGI("recv [chat] %s", preview(ev.text).c_str());
+                            else
+                                XC_LOGD("recv [chat] %s", preview(ev.text).c_str());
                         } else {
                             XC_LOGD("recv [%s] %s", ev.ch.c_str(), preview(ev.text).c_str());
                         }
@@ -1181,7 +1567,7 @@ struct Streamer::Impl {
                 if (ready || since(ackAt) > kChannelsReadyGraceMs) {
                     if (!ready) XC_LOGW("control/input channel not open %d ms after HandshakeAck", kChannelsReadyGraceMs);
                     ackPending = false;
-                    afterHandshakeAck(r);
+                    afterHandshakeAck(r, gen);
                     handshakeAt = now;
                     if (!resuming) setStatus("Waiting for video...");
                 }
@@ -1197,6 +1583,9 @@ struct Streamer::Impl {
                 fail("Connection timed out");
                 return PeerOutcome::Finished;
             }
+
+            // ---- voice chat renegotiation (mic open, or at most kRenegMicWaitMs after the handshake) ----
+            maybeStartRenegotiation(gssv, sess, r, gen);
 
             // ---- first frame / streaming ----
             if (gotFrame) {
@@ -1631,6 +2020,7 @@ struct Streamer::Impl {
             std::lock_guard<std::mutex> lk(evMu);
             quit = true;
         }
+        renegAbort = true;  // in-flight renegotiation requests abort too
         evCv.notify_all();
         {
             std::lock_guard<std::mutex> lk(frameMu);
@@ -1763,6 +2153,8 @@ struct Streamer::Impl {
         videoLossPct = 0;
         frameW = 0;
         frameH = 0;
+        voiceSessionOff = false;
+        chatRxPackets = 0;
         {
             std::lock_guard<std::mutex> lk(inputMu);
             serializer = proto::InputSerializer();
@@ -1787,8 +2179,9 @@ struct Streamer::Impl {
         setState(StreamState::Starting);
         setStatus("Starting...");
 
-        XC_LOGI("stream start: %s %s (res %s, %d kbps)", kind == SessionKind::Home ? "home" : "cloud", target.c_str(),
-                settings.resolution.c_str(), settings.bitrateKbps);
+        XC_LOGI("stream start: %s %s (res %s, %d kbps, voice chat %s%s)", kind == SessionKind::Home ? "home" : "cloud",
+                target.c_str(), settings.resolution.c_str(), settings.bitrateKbps, settings.voiceChat ? "on" : "off",
+                settings.voiceChat && micMuted.load() ? ", mic muted" : "");
 
         if (!decoder.init(4)) {
             fail("The video decoder could not be initialised");
@@ -1921,6 +2314,32 @@ StreamStats Streamer::stats() const {
 }
 
 void Streamer::requestKeyframe() { d_->requestKeyframeInternal(false); }
+
+void Streamer::setMicMuted(bool muted) {
+    Impl& d = *d_;
+    d.micMuted = muted;
+    if (std::shared_ptr<VoiceChat> v = d.currentVoice()) v->setMuted(muted);
+}
+
+bool Streamer::micMuted() const { return d_->micMuted.load(); }
+
+MicState Streamer::micState() const {
+    std::shared_ptr<VoiceChat> v = d_->currentVoice();
+    if (!v) return MicState::Off;
+    switch (v->state()) {
+        case VoiceChat::State::Unavailable: return MicState::Unavailable;
+        case VoiceChat::State::Muted: return MicState::Muted;
+        case VoiceChat::State::Live: return MicState::Live;
+        case VoiceChat::State::Off:
+        case VoiceChat::State::Starting: return MicState::Off;
+    }
+    return MicState::Off;
+}
+
+float Streamer::micLevel() const {
+    std::shared_ptr<VoiceChat> v = d_->currentVoice();
+    return v ? v->level() : 0.0f;
+}
 
 void Streamer::stop() {
     Impl& d = *d_;

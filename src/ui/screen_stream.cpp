@@ -280,6 +280,14 @@ public:
         while (s.takeVibration(v))
             if (!menuOpen_) pad.rumble(v);
 
+        // microphone: first Live of this stream -> tell the user it is on and how to mute it
+        micState_ = s.micState();
+        micLevel_ = micState_ == MicState::Live ? s.micLevel() : 0.0f;
+        if (micState_ == MicState::Live && !micToastShown_) {
+            micToastShown_ = true;
+            app.toast("Microphone on - mute it in the stream menu (Options + touchpad)");
+        }
+
         // stats
         ++displayFrames_;
         if (now - statsAt_ >= kStatsRefreshMs) {
@@ -319,6 +327,7 @@ public:
         }
 
         if (app.statsOverlay() && !ended_) renderStats(ui);
+        if (!ended_) renderMicIndicator(ui);
 
         if (!ended_ && !menuOpen_ && now - enteredAt_ < kStartHintMs) {
             const bool kb = app.gamepad().lastInputKeyboard();
@@ -337,7 +346,7 @@ public:
     }
 
 private:
-    enum MenuItem { ItemResume, ItemNexus, ItemStats, ItemKeyframe, ItemDisconnect, kMenuItems };
+    enum MenuItem { ItemResume, ItemNexus, ItemMic, ItemStats, ItemKeyframe, ItemDisconnect, kMenuItems };
 
     void openMenu(App& app) {
         menuOpen_ = true;
@@ -390,6 +399,18 @@ private:
                 closeMenu(app);  // Cross is suppressed: the game gets Nexus alone
                 nexusUntil_ = platform::monotonicMs() + kNexusPulseMs;
                 break;
+            case ItemMic: {
+                // Unavailable / voice chat off: the item is shown greyed out and does nothing.
+                const MicState ms = app.streamer().micState();
+                if (ms != MicState::Live && ms != MicState::Muted) break;
+                const bool mute = !app.streamer().micMuted();
+                app.streamer().setMicMuted(mute);
+                micState_ = mute ? MicState::Muted : MicState::Live;
+                if (mute) micLevel_ = 0.0f;
+                XC_LOGI("stream: microphone %s by user", mute ? "muted" : "unmuted");
+                app.toast(mute ? "Microphone muted" : "Microphone on");
+                break;  // the menu stays open
+            }
             case ItemStats: app.setStatsOverlay(!app.statsOverlay()); break;
             case ItemKeyframe:
                 app.streamer().requestKeyframe();
@@ -446,7 +467,7 @@ private:
     }
 
     void renderStats(Ui& ui) {
-        char l1[96], l2[96], l3[128], l4[64];
+        char l1[96], l2[96], l3[128], l4[64], l5[96];
         const StreamStats& s = stats_;
         std::snprintf(l1, sizeof(l1), "%d \xC3\x97 %d  \xC2\xB7  %.1f fps", s.width ? s.width : texW_,
                       s.height ? s.height : texH_, s.fps);
@@ -457,17 +478,54 @@ private:
         else
             std::snprintf(l3, sizeof(l3), "decode %.1f ms  \xC2\xB7  audio %d ms", s.decodeMs, s.audioBufferMs);
         std::snprintf(l4, sizeof(l4), "display %.0f fps", displayFps_);
-        const char* lines[] = {l1, l2, l3, l4};
+        std::snprintf(l5, sizeof(l5), "mic %s %d kbps | chat rx %llu", micStateLabel(micState_), s.micTxKbps,
+                      static_cast<unsigned long long>(s.chatRxPackets));
+        const char* lines[] = {l1, l2, l3, l4, l5};
+        constexpr int n = static_cast<int>(sizeof(lines) / sizeof(lines[0]));
         int w = 0;
         for (auto* l : lines) w = std::max(w, ui.textWidth(l, 22));
         const int lh = ui.lineHeight(22);
-        ui.rect(28, 28, w + 48, lh * 4 + 32, withAlpha(colors::Black, 160), true, 14);
-        ui.rect(28, 44, 4, lh * 4, colors::AccentBright, true, 2);
+        ui.rect(28, 28, w + 48, lh * n + 32, withAlpha(colors::Black, 160), true, 14);
+        ui.rect(28, 44, 4, lh * n, colors::AccentBright, true, 2);
         int y = 44;
-        for (int i = 0; i < 4; ++i) {
+        for (int i = 0; i < n; ++i) {
             ui.text(lines[i], 52, y, 22, i == 0 ? colors::White : colors::Text, Align::Left, i == 0);
             y += lh;
         }
+    }
+
+    static const char* micStateLabel(MicState m) {
+        switch (m) {
+            case MicState::Off: return "off";
+            case MicState::Unavailable: return "unavailable";
+            case MicState::Muted: return "muted";
+            case MicState::Live: return "live";
+        }
+        return "?";
+    }
+
+    // Top-right microphone badge while voice chat runs: white capsule + green level bar when
+    // live, grey capsule with a red slash when muted. Hidden in every other state.
+    void renderMicIndicator(Ui& ui) {
+        if (micState_ != MicState::Live && micState_ != MicState::Muted) return;
+        const bool live = micState_ == MicState::Live;
+        constexpr int kBox = 40, kMargin = 16;
+        const int bx = Ui::kWidth - kMargin - kBox, by = kMargin;
+        ui.rect(bx, by, kBox, kBox, withAlpha(colors::Black, 150), true, 10);
+        const Color cap = live ? colors::White : colors::TextDim;
+        // capsule 12x20, centred horizontally, a little above centre to leave room for the stand
+        const int cw = 12, ch = 20, cx = bx + (kBox - cw) / 2, cy = by + 6;
+        ui.rect(cx, cy, cw, ch, cap, true, 6);
+        if (live) {
+            // level fill from the bottom of the capsule, height = level x 20
+            const float lv = std::max(0.0f, std::min(1.0f, micLevel_));
+            const int lh = static_cast<int>(std::lround(lv * ch));
+            if (lh > 0) ui.rect(cx + 2, cy + ch - lh, cw - 4, lh, Color{60, 200, 90, 255}, true, 4);
+        }
+        // stand: short stem + base bar
+        ui.rect(bx + kBox / 2 - 1, cy + ch + 1, 2, 5, cap);
+        ui.rect(bx + kBox / 2 - 6, cy + ch + 6, 12, 2, cap, true, 1);
+        if (!live) ui.line(bx + 9.0f, by + kBox - 9.0f, bx + kBox - 9.0f, by + 9.0f, 3.0f, colors::Error);
     }
 
     void renderMenu(App& app, Ui& ui) {
@@ -487,19 +545,36 @@ private:
         int iy = y + 150;
         for (int i = 0; i < kMenuItems; ++i) {
             std::string label;
+            bool dim = false;  // shown but inactive
             switch (i) {
                 case ItemResume: label = "Resume"; break;
                 case ItemNexus: label = "Press Xbox button"; break;
+                case ItemMic:
+                    switch (micState_) {
+                        case MicState::Live: label = "Mute microphone"; break;
+                        case MicState::Muted: label = "Unmute microphone"; break;
+                        case MicState::Unavailable:
+                            label = "Microphone unavailable";
+                            dim = true;
+                            break;
+                        case MicState::Off:
+                            label = "Voice chat off";
+                            dim = true;
+                            break;
+                    }
+                    break;
                 case ItemStats: label = app.statsOverlay() ? "Hide statistics" : "Show statistics"; break;
                 case ItemKeyframe: label = "Refresh video"; break;
                 case ItemDisconnect: label = "Disconnect"; break;
             }
             const bool f = i == menuFocus_;
             if (f) {
-                ui.rect(x + 32, iy, w - 64, itemH, i == ItemDisconnect ? Color{150, 45, 40, 255} : colors::Accent, true, 14);
+                const Color bg = dim ? colors::PanelHi : (i == ItemDisconnect ? Color{150, 45, 40, 255} : colors::Accent);
+                ui.rect(x + 32, iy, w - 64, itemH, bg, true, 14);
             }
-            ui.text(label, x + 64, iy + (itemH - ui.lineHeight(28, f)) / 2, 28,
-                    f ? colors::White : (i == ItemDisconnect ? Color{255, 140, 130, 255} : colors::Text), Align::Left, f);
+            const Color fg = dim ? colors::TextDim
+                                 : (f ? colors::White : (i == ItemDisconnect ? Color{255, 140, 130, 255} : colors::Text));
+            ui.text(label, x + 64, iy + (itemH - ui.lineHeight(28, f)) / 2, 28, fg, Align::Left, f);
             iy += itemH + gap;
         }
         ui::hintBar(app, ui, {{PadIcon::Cross, "Select"}, {PadIcon::Circle, "Resume"}});
@@ -537,6 +612,9 @@ private:
     std::string endMsg_;
 
     uint64_t enteredAt_ = 0;
+    MicState micState_ = MicState::Off;
+    float micLevel_ = 0.0f;
+    bool micToastShown_ = false;  // "Microphone on" toast: once per stream screen
     StreamStats stats_;
     uint64_t statsAt_ = 0;
     uint64_t videoFrames_ = 0;

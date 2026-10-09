@@ -121,3 +121,40 @@ XC_TEST(config, gssv_device_tier_and_auth_rejection) {
     XC_CHECK(!gssv::isAuthRejection(400, ""));
     XC_CHECK(!gssv::isAuthRejection(200, ""));
 }
+
+// Voice chat is on by default, persists when turned off, and an older config file without the
+// key keeps the default (on).
+XC_TEST(config, voice_chat_setting) {
+    XC_CHECK(Settings().voiceChat);
+    const std::string path = tempPath();
+    {
+        Config c(path);
+        XC_REQUIRE(c.load());
+        XC_CHECK(c.settings().voiceChat);
+        c.updateSettings([](Settings& s) { s.voiceChat = false; });
+        XC_REQUIRE(c.save());
+    }
+    {
+        Config d(path);
+        XC_REQUIRE(d.load());
+        XC_CHECK(!d.settings().voiceChat);
+        d.updateSettings([](Settings& s) { s.voiceChat = true; });
+        XC_REQUIRE(d.save());
+    }
+    {
+        Config e(path);
+        XC_REQUIRE(e.load());
+        XC_CHECK(e.settings().voiceChat);
+    }
+    {
+        FILE* f = std::fopen(path.c_str(), "wb");
+        XC_REQUIRE(f != nullptr);
+        std::fputs("{\"version\":1,\"settings\":{\"resolution\":\"720\",\"f2pFallback\":false}}", f);
+        std::fclose(f);
+        Config g(path);
+        XC_REQUIRE(g.load());
+        XC_CHECK_EQ(g.settings().resolution, std::string("720"));
+        XC_CHECK(g.settings().voiceChat);
+    }
+    std::remove(path.c_str());
+}

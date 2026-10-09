@@ -23,6 +23,10 @@ enum class StreamState { Idle, Starting, Queued, Provisioning, Connecting, Strea
 // Human readable name for a state (logs / UI).
 const char* streamStateName(StreamState s);
 
+// Microphone / voice chat state of the running stream, for the stream menu and indicator.
+// Off = voice chat disabled in Settings, not streaming, or the mic is still being opened.
+enum class MicState { Off, Unavailable, Muted, Live };
+
 // Live statistics for the stream overlay.
 struct StreamStats {
     int width = 0, height = 0;
@@ -32,6 +36,10 @@ struct StreamStats {
     double lossPercent = 0;    // video packet loss over the last second
     int rttMs = -1;            // unknown = -1
     int audioBufferMs = 0;
+    bool voiceNegotiated = false;    // the SDP answer had chatStream >= 1
+    bool voiceRenegotiated = false;  // the chat renegotiation (second offer) was applied
+    int micTxKbps = 0;               // microphone RTP sent, kbps over the last second
+    uint64_t chatRxPackets = 0;      // separate chat-SSRC voice packets played (this session)
 };
 
 class Streamer {
@@ -72,6 +80,16 @@ public:
 
     // Send a keyframe request (PLI + control message), rate-limited.
     void requestKeyframe();
+
+    // Microphone mute (voice chat). Thread-safe. The flag survives reconnects and later
+    // sessions of this process (not saved to disk); a muted mic keeps sending silence.
+    void setMicMuted(bool muted);
+    bool micMuted() const;
+    // Current microphone state (Off while voice chat is off, the mic is still opening, or no
+    // stream runs). Thread-safe, cheap enough to call every frame.
+    MicState micState() const;
+    // Peak input level of the last ~100 ms, 0..1 (0 when muted / unavailable / off).
+    float micLevel() const;
 
     // Request the session to stop without blocking: signals the worker (in-flight requests
     // abort within ~1 s) and queues the teardown (DELETE on gssv, close PC, release

@@ -31,6 +31,7 @@ to your TV with a DualSense as the controller.
 | Queue / waiting for a server | ✅ works on PS5 |
 | Cloud streaming (video, audio, controller, rumble) | ✅ works on PS5 |
 | Remote play of your own Xbox console (xHome) | ⚠️ implemented, not tested |
+| Voice chat (headset mic, party/game chat) | ⚠️ implemented, needs hardware testing |
 | Native PS5 title / home-screen tile | ❌ not supported (start it from the websrv launcher) |
 
 Video is decoded in software (FFmpeg). If the picture stutters, set the resolution to 720p.
@@ -102,7 +103,7 @@ load your library or stream.
 
 ## Installation
 
-1. Download `nubix-v<version>-websrv.zip` (e.g. `nubix-v0.3.0-websrv.zip`) from the releases page.
+1. Download `nubix-v<version>-websrv.zip` (e.g. `nubix-v0.4.0-websrv.zip`) from the releases page.
 2. Unzip it and copy the `nubix` folder to `/data/homebrew/` on the PS5 (FTP, or a USB drive
    under `/mnt/usb0/homebrew/`). You should end up with
    `/data/homebrew/nubix/{eboot.elf, homebrew.js, sce_sys/icon0.png, assets/}`.
@@ -131,7 +132,7 @@ The PS5 system keeps the PS and Create buttons to itself, so the app never sees 
 | L1 / R1, L2 / R2, L3 / R3 | LB / RB, LT / RT, LS / RS |
 | Options | Menu |
 | Touchpad click | View |
-| Hold **Options + touchpad** for 1 s | Stream menu (resume, Xbox button, statistics, refresh video, disconnect) |
+| Hold **Options + touchpad** for 1 s | Stream menu (resume, Xbox button, mute/unmute microphone, statistics, refresh video, disconnect) |
 
 In the menus: ✕ = select, ○ = back, L1/R1 = switch tabs, △ = filter.
 
@@ -141,7 +142,28 @@ In the menus: ✕ = select, ○ = back, L1/R1 = switch tabs, △ = filter.
 - **Maximum bitrate**: 5–20 Mbps. Lower it on Wi-Fi or if the picture stutters.
 - **Server region**: automatic or one of the regions Xbox offers your account.
 - **Free-to-play fallback**: retry with the ad-supported offering when a title is not in your plan.
+- **Voice chat**: on (default) or off, see [Voice chat](#voice-chat). Applies to the next stream.
 - **Extra stick deadzone**, **stream statistics**, **sign out**.
+
+## Voice chat
+
+Talk and listen in Xbox party chat and in-game chat while you stream:
+
+- Plug a headset into the DualSense (or use a USB headset), or use the DualSense's built-in
+  microphone. Your voice goes to the streamed console; other players' voices play together with
+  the game audio, on the headset when one is connected.
+- When a stream starts, a toast says the microphone is on, and a small microphone badge appears in
+  the top-right corner (green level bar = live, red slash = muted).
+- **Mute / unmute** in the stream menu (hold Options + touchpad for 1 s → *Mute microphone*). Muting
+  sends silence and stays in effect for later streams until you unmute or restart Nubix.
+- **Settings → Voice chat → Off** turns the feature off completely (no microphone use, the stream is
+  set up exactly as before). Use it if a stream ever fails to start with voice chat on.
+- Without a headset, the DualSense microphone may pick up the TV and other players may hear an
+  echo of the game: use a headset, or mute the microphone.
+- No microphone found: the stream menu shows *Microphone unavailable* and the stream runs normally.
+- Party or game chat works when the party belongs to the streamed session, i.e. you create or join
+  it from the Xbox guide inside the stream. **Known limitation:** a party that exists only in the
+  Xbox app or on a phone, without the streamed console in it, is not heard (not supported yet).
 
 ## Network behaviour
 
@@ -161,6 +183,13 @@ Nubix talks to the same Microsoft services as the Xbox web player, and paces its
 - Sign-in, library or box art fail only with the protective DNS: start `tools/sony_dns.py --log-all`
   and look for BLOCK lines while Nubix loads; please report them so the built-in list can be fixed.
 - Close other running homebrew before starting Nubix (websrv can crash otherwise).
+- Voice chat: the log shows every step under `voice:` (microphone open attempts, `voice: answer
+  chat=… chatStream=…`, renegotiation, `first mic RTP sent`). The statistics overlay shows
+  `mic <state> <kbps> | chat rx <packets>`. If a stream does not start with voice chat on, set
+  *Settings → Voice chat* to Off and please report the log.
+- Voice chat and game sound play on the TV instead of the headset: on the PS5 set *Settings → Sound →
+  Audio Output → Output to Headphones* to *All Audio*. (Nubix plays everything through one output;
+  a separate voice-only output to the headset is a possible later addition.)
 
 ## Privacy and security
 
@@ -169,6 +198,9 @@ Nubix talks to the same Microsoft services as the Xbox web player, and paces its
   file access to the console (for example an open FTP payload on your network) can copy it. Do not
   leave FTP running on untrusted networks. *Settings → Sign out* deletes it; you can also sign out of
   all devices in your Microsoft account's security settings.
+- With voice chat on, your microphone audio is sent to the streamed Xbox session (and from there to
+  the people you chat with) only while a stream is running. Mute it in the stream menu or turn voice
+  chat off in Settings.
 - The app only contacts Microsoft services (sign-in, Xbox Live, cloud gaming, Microsoft Store catalog)
   plus Google's public STUN server (`stun.l.google.com`) to find its public address for WebRTC.
 

@@ -19,6 +19,7 @@ struct Settings {
     std::string locale = "en-US";     // used for catalog + session start
     bool f2pFallback = true;          // retry cloud start with the F2P offering on OfferingDoesNotContainTitle
     int stickDeadzone = 0;            // extra radial deadzone in percent (0 = rely on server)
+    bool voiceChat = true;            // negotiate in-stream voice chat + capture the headset/controller mic
 };
 
 // One gssv region of an offering, from /v2/login/user offeringSettings.regions[].

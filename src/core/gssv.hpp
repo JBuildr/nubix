@@ -27,6 +27,18 @@ struct SessionInfo {
     std::string host;
 };
 
+// GET {sessionPath}/sdp answer with the exchangeResponse fields voice chat needs.
+struct SdpAnswerInfo {
+    std::string sdp;          // verbatim answer SDP (CRLF intact)
+    int chat = -1;            // exchangeResponse.chat (-1 absent)
+    int chatStream = -1;      // exchangeResponse.chatStream (-1 absent)
+    std::string summary;      // proto::SdpExchangeFields::summary
+    // Set when pollSdpAnswer failed because the server refused the exchange itself (errorDetails,
+    // exchangeResponse.status other than "success", answer without sdp) rather than a transport
+    // or HTTP error. Polling again will not change the outcome.
+    bool rejected = false;
+};
+
 // Well-known gssv error codes (SessionInfo::errorCode).
 constexpr const char* kErrOfferingDoesNotContainTitle = "OfferingDoesNotContainTitle";
 
@@ -72,11 +84,17 @@ public:
     // Queue wait time in seconds for a cloud title (GET /v1/waittime/{titleId}); -1 if unknown.
     int waitTimeSeconds(const std::string& titleId);
 
-    // POST {sessionPath}/sdp with proto::sdpPostBody(offer).
-    bool sendSdpOffer(const SessionInfo& s, const std::string& sdp, std::string& err);
+    // POST {sessionPath}/sdp with proto::sdpPostBody(offer, chatStream).
+    bool sendSdpOffer(const SessionInfo& s, const std::string& sdp, std::string& err, bool chatStream = false);
+
+    // POST {sessionPath}/sdp with proto::sdpChatRenegotiationBody(sdp) (voice chat second offer).
+    bool sendSdpRenegotiation(const SessionInfo& s, const std::string& sdp, std::string& err);
 
     // GET {sessionPath}/sdp. ready=false while the server has not answered yet (HTTP 204).
+    // Forwards to the SdpAnswerInfo overload.
     bool pollSdpAnswer(const SessionInfo& s, std::string& answerSdp, bool& ready, std::string& err);
+    // Same, returning every exchange field (logs "sdp exchange fields: ..." once per answer).
+    bool pollSdpAnswer(const SessionInfo& s, SdpAnswerInfo& out, bool& ready, std::string& err);
 
     // POST {sessionPath}/ice with proto::icePostBody(candidateLines, ufrag).
     bool sendIce(const SessionInfo& s, const std::vector<std::string>& candidateLines, const std::string& ufrag,

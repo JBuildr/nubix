@@ -12,8 +12,13 @@
 // Ring, prebuffer, servo and resampler design are ported from green-nx
 // (src/switch/stream/audio_player.cpp, GPL-3.0); the output side uses SDL instead of audout.
 //
-// Threads: pushRtp()/pushOpus()/reset() may be called from any thread (normally the
-// libdatachannel track callback); the SDL audio thread only touches the ring under ringMu.
+// Chat voice: a second, independent Opus stream (party / game chat delivered on its own SSRC)
+// has its own decoder and a small ring (40 ms prebuffer, 120 ms cap, no servo); fill() sums it
+// into the game output with int16 saturation before the output mute is applied.
+//
+// Threads: pushRtp()/pushOpus()/pushVoiceOpus()/reset() may be called from any thread (normally
+// the libdatachannel track callback); the SDL audio thread only touches the game ring under
+// ringMu and the voice ring under voice.ringMu. The two ring locks are never held together.
 #include "stream/audio.hpp"
 
 #include "core/log.hpp"
@@ -23,6 +28,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <climits>
 #include <cstring>
 #include <mutex>
 #include <vector>
@@ -49,9 +55,133 @@ constexpr float kServoEmaAlpha = 0.02f;
 constexpr float kServoGain = 30e-6f;
 constexpr float kServoMaxAdj = 2000e-6f;
 
+// Chat voice stream (second SSRC).
+constexpr int kVoiceRingMs = 300;
+constexpr int kVoicePrebufferMs = 40;
+constexpr int kVoiceCapMs = 120;  // above this, shed...
+constexpr int kVoiceTrimMs = 60;  // ...down to here
+
 }  // namespace
 
+// Independent chat-voice stream: decoder + ring, no clock servo (voice is bursty and short
+// lived; the cap bounds latency instead).
+struct VoiceStream {
+    std::mutex decMu;  // decoder state
+    OpusDecoder* dec = nullptr;
+    int lastFrameSamples = kSampleRate / 50;
+    std::vector<int16_t> pcm;
+    bool announced = false;  // "chat voice stream started" logged since the last reset
+
+    std::mutex ringMu;  // ring state; taken by the SDL thread, never while holding game ringMu
+    std::vector<int16_t> ring;
+    int ringSize = 0;
+    int readPos = 0, writePos = 0, count = 0;
+    bool primed = false;
+
+    std::atomic<uint64_t> packets{0}, lost{0}, droppedSamples{0};
+    std::atomic<int> bufferedSamples{0};
+
+    void resetRing() {
+        std::lock_guard<std::mutex> lk(ringMu);
+        readPos = writePos = count = 0;
+        primed = false;
+        bufferedSamples.store(0, std::memory_order_relaxed);
+    }
+
+    void resetDecoderLocked() {
+        if (dec) opus_decoder_ctl(dec, OPUS_RESET_STATE);
+        lastFrameSamples = kSampleRate / 50;
+        announced = false;
+    }
+
+    void pushRing(const int16_t* data, int n) {
+        if (n <= 0) return;
+        const int cap = kVoiceCapMs * kInt16PerMs;
+        const int trim = kVoiceTrimMs * kInt16PerMs;
+        std::lock_guard<std::mutex> lk(ringMu);
+        if (ringSize == 0) return;
+        if (n > ringSize) {
+            data += n - ringSize;
+            n = ringSize;
+        }
+        if (count + n > cap) {
+            int shed = std::min(count + n - trim, count);
+            if (shed > 0) {
+                shed -= shed % kChannels;
+                readPos = (readPos + shed) % ringSize;
+                count -= shed;
+                droppedSamples.fetch_add(static_cast<uint64_t>(shed), std::memory_order_relaxed);
+            }
+        }
+        if (count + n > ringSize) {
+            const int over = count + n - ringSize;
+            readPos = (readPos + over) % ringSize;
+            count -= over;
+            droppedSamples.fetch_add(static_cast<uint64_t>(over), std::memory_order_relaxed);
+        }
+        const int first = std::min(n, ringSize - writePos);
+        std::memcpy(&ring[writePos], data, static_cast<size_t>(first) * sizeof(int16_t));
+        if (n > first)
+            std::memcpy(&ring[0], data + first, static_cast<size_t>(n - first) * sizeof(int16_t));
+        writePos = (writePos + n) % ringSize;
+        count += n;
+        if (!primed && count >= kVoicePrebufferMs * kInt16PerMs) primed = true;
+        bufferedSamples.store(count, std::memory_order_relaxed);
+    }
+
+    // decMu held.
+    void decodeAndQueue(const uint8_t* data, size_t n, int frameSamples, bool fec) {
+        if (!dec) return;
+        const int maxSamples = (data && !fec) ? kMaxFrameSamples : frameSamples;
+        const int got = opus_decode(dec, data, static_cast<opus_int32>(data ? n : 0), pcm.data(),
+                                    maxSamples, fec ? 1 : 0);
+        if (got <= 0) return;
+        if (data && !fec) lastFrameSamples = got;
+        pushRing(pcm.data(), got * kChannels);
+    }
+
+    // decMu held.
+    void handleOpus(const uint8_t* data, size_t n, int lostBefore) {
+        if (!dec) return;
+        if (!announced) {
+            announced = true;
+            XC_LOGI("audio: chat voice stream started");
+        }
+        int frameSamples = lastFrameSamples;
+        const int ns = opus_packet_get_nb_samples(data, static_cast<opus_int32>(n), kSampleRate);
+        if (ns > 0 && ns <= kMaxFrameSamples) frameSamples = ns;
+        if (lostBefore > 0) {
+            lost.fetch_add(static_cast<uint64_t>(lostBefore), std::memory_order_relaxed);
+            const int conceal = std::min(lostBefore, kMaxConcealFrames);
+            for (int i = 0; i < conceal - 1; ++i) decodeAndQueue(nullptr, 0, lastFrameSamples, false);
+            decodeAndQueue(data, n, frameSamples, true);
+        }
+        decodeAndQueue(data, n, frameSamples, false);
+        packets.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    // SDL audio thread: add up to `need` buffered voice samples onto out.
+    void mixInto(int16_t* out, int need) {
+        std::lock_guard<std::mutex> lk(ringMu);
+        if (primed && ringSize > 0) {
+            int done = 0;
+            while (done < need && count > 0) {
+                const int step = std::min({need - done, count, ringSize - readPos});
+                AudioPlayer::mixSaturate(out + done, &ring[readPos], step);
+                readPos = (readPos + step) % ringSize;
+                count -= step;
+                done += step;
+            }
+            // Ran dry: wait for a fresh prebuffer (the talker paused or packets were lost).
+            if (count == 0) primed = false;
+        }
+        bufferedSamples.store(count, std::memory_order_relaxed);
+    }
+};
+
 struct AudioPlayer::Impl {
+    VoiceStream voice;
+
     // ---- decoder side (guarded by decMu) ----
     std::mutex decMu;
     OpusDecoder* dec = nullptr;
@@ -226,6 +356,7 @@ struct AudioPlayer::Impl {
         }
         if (given < need)
             std::memset(out + given, 0, static_cast<size_t>(need - given) * sizeof(int16_t));
+        voice.mixInto(out, need);
         if (muted.load(std::memory_order_relaxed))
             std::memset(out, 0, static_cast<size_t>(need) * sizeof(int16_t));
     }
@@ -277,6 +408,27 @@ bool AudioPlayer::init() {
         d.ring.assign(static_cast<size_t>(d.ringSize), 0);
     }
     d.resetRing();
+    {
+        // Chat voice decoder: failure only disables the voice mix, never game audio.
+        std::lock_guard<std::mutex> lk(d.voice.decMu);
+        int err = OPUS_OK;
+        d.voice.dec = opus_decoder_create(kSampleRate, kChannels, &err);
+        if (err != OPUS_OK || !d.voice.dec) {
+            XC_LOGW("audio: chat voice decoder unavailable: %s", opus_strerror(err));
+            d.voice.dec = nullptr;
+        }
+        d.voice.pcm.assign(static_cast<size_t>(kMaxFrameSamples) * kChannels, 0);
+        d.voice.resetDecoderLocked();
+    }
+    {
+        std::lock_guard<std::mutex> lk(d.voice.ringMu);
+        d.voice.ringSize = kVoiceRingMs * kInt16PerMs;
+        d.voice.ring.assign(static_cast<size_t>(d.voice.ringSize), 0);
+    }
+    d.voice.resetRing();
+    d.voice.packets = 0;
+    d.voice.lost = 0;
+    d.voice.droppedSamples = 0;
     d.packets = 0;
     d.lost = 0;
     d.late = 0;
@@ -388,6 +540,41 @@ void AudioPlayer::reset() {
         d_->resetDecoderStateLocked();
     }
     d_->resetRing();
+    resetVoice();
+}
+
+void AudioPlayer::pushVoiceOpus(const uint8_t* opus, size_t n, int lostBefore) {
+    if (!opus || n == 0) return;
+    VoiceStream& v = d_->voice;
+    std::lock_guard<std::mutex> lk(v.decMu);
+    if (!v.dec) return;
+    v.handleOpus(opus, n, lostBefore < 0 ? 0 : lostBefore);
+}
+
+void AudioPlayer::resetVoice() {
+    VoiceStream& v = d_->voice;
+    {
+        std::lock_guard<std::mutex> lk(v.decMu);
+        v.resetDecoderLocked();
+    }
+    v.resetRing();
+}
+
+AudioPlayer::VoiceStats AudioPlayer::voiceStats() const {
+    const VoiceStream& v = d_->voice;
+    VoiceStats s;
+    s.packets = v.packets.load(std::memory_order_relaxed);
+    s.lost = v.lost.load(std::memory_order_relaxed);
+    s.droppedMs = v.droppedSamples.load(std::memory_order_relaxed) / kInt16PerMs;
+    s.bufferedMs = v.bufferedSamples.load(std::memory_order_relaxed) / kInt16PerMs;
+    return s;
+}
+
+void AudioPlayer::mixSaturate(int16_t* dst, const int16_t* src, int n) {
+    for (int i = 0; i < n; ++i) {
+        const int32_t s = static_cast<int32_t>(dst[i]) + static_cast<int32_t>(src[i]);
+        dst[i] = static_cast<int16_t>(std::clamp<int32_t>(s, INT16_MIN, INT16_MAX));
+    }
 }
 
 int AudioPlayer::bufferedMs() const {
@@ -435,6 +622,20 @@ void AudioPlayer::close() {
         d.resetDecoderStateLocked();
     }
     d.resetRing();
+    {
+        std::lock_guard<std::mutex> lk(d.voice.decMu);
+        if (d.voice.dec) {
+            if (d.voice.packets.load() > 0)
+                XC_LOGI("audio: chat voice closed (%llu packets, %llu lost, %llu ms dropped)",
+                        static_cast<unsigned long long>(d.voice.packets.load()),
+                        static_cast<unsigned long long>(d.voice.lost.load()),
+                        static_cast<unsigned long long>(d.voice.droppedSamples.load() / kInt16PerMs));
+            opus_decoder_destroy(d.voice.dec);
+            d.voice.dec = nullptr;
+        }
+        d.voice.resetDecoderLocked();
+    }
+    d.voice.resetRing();
 }
 
 }  // namespace xc

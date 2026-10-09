@@ -408,9 +408,9 @@ int GssvClient::waitTimeSeconds(const std::string& titleId) {
     return -1;
 }
 
-bool GssvClient::sendSdpOffer(const SessionInfo& s, const std::string& sdp, std::string& err) {
-    HttpResponse r =
-        Http::request("POST", sessionUrl(s, "sdp"), headers(), proto::sdpPostBody(sdp), kRequestTimeoutSec);
+bool GssvClient::sendSdpOffer(const SessionInfo& s, const std::string& sdp, std::string& err, bool chatStream) {
+    HttpResponse r = Http::request("POST", sessionUrl(s, "sdp"), headers(), proto::sdpPostBody(sdp, chatStream),
+                                   kRequestTimeoutSec);
     noteResponse(r);
     if (!r.ok()) {
         err = describeFailure("sdp offer", r);
@@ -419,8 +419,33 @@ bool GssvClient::sendSdpOffer(const SessionInfo& s, const std::string& sdp, std:
     return true;
 }
 
+bool GssvClient::sendSdpRenegotiation(const SessionInfo& s, const std::string& sdp, std::string& err) {
+    HttpResponse r = Http::request("POST", sessionUrl(s, "sdp"), headers(), proto::sdpChatRenegotiationBody(sdp),
+                                   kRequestTimeoutSec);
+    noteResponse(r);
+    if (!r.ok()) {
+        err = describeFailure("sdp renegotiation", r);
+        return false;
+    }
+    if (!isPending(r) && !r.body.empty()) {
+        json parsed = json::parse(r.body, nullptr, false);
+        if (!parsed.is_discarded() && parsed.is_object() && isRealExchangeError(parsed)) {
+            err = "sdp renegotiation: " + snippet(parsed.dump(-1, ' ', false, json::error_handler_t::replace), 400);
+            return false;
+        }
+    }
+    return true;
+}
+
 bool GssvClient::pollSdpAnswer(const SessionInfo& s, std::string& answerSdp, bool& ready, std::string& err) {
-    answerSdp.clear();
+    SdpAnswerInfo info;
+    const bool ok = pollSdpAnswer(s, info, ready, err);
+    answerSdp = ready ? std::move(info.sdp) : std::string();
+    return ok;
+}
+
+bool GssvClient::pollSdpAnswer(const SessionInfo& s, SdpAnswerInfo& out, bool& ready, std::string& err) {
+    out = SdpAnswerInfo{};
     ready = false;
     HttpResponse r = Http::request("GET", sessionUrl(s, "sdp"), headers(), "", kRequestTimeoutSec);
     noteResponse(r);
@@ -436,27 +461,36 @@ bool GssvClient::pollSdpAnswer(const SessionInfo& s, std::string& answerSdp, boo
     }
     if (isRealExchangeError(parsed)) {
         err = "sdp exchange: " + snippet(parsed.dump(), 400);
+        out.rejected = true;
         return false;
     }
     // exchangeResponse is a JSON *string* holding {"sdp":"v=0...","sdpType":"answer",...}.
-    json exchange;
     auto it = parsed.find("exchangeResponse");
     if (it == parsed.end() || it->is_null()) return true;  // not answered yet
-    if (it->is_string()) exchange = json::parse(it->get<std::string>(), nullptr, false);
-    else exchange = *it;
-    if (exchange.is_discarded() || !exchange.is_object()) {
+    proto::SdpExchangeFields f;
+    const std::string raw = it->is_string() ? it->get<std::string>() : it->dump(-1, ' ', false, json::error_handler_t::replace);
+    if (!proto::parseExchangeFields(raw, f)) {
         err = "sdp exchange: unparsable exchangeResponse";
         return false;
     }
-    const std::string status = jsonString(exchange, "status");
-    auto sdpIt = exchange.find("sdp");
-    if (sdpIt == exchange.end() || !sdpIt->is_string() || sdpIt->get<std::string>().empty()) {
-        err = "sdp exchange: answer has no sdp" + (status.empty() ? std::string() : " (status " + status + ")") +
-              ": " + snippet(exchange.dump(), 400);
+    if (f.sdp.empty()) {
+        err = "sdp exchange: answer has no sdp" + (f.status.empty() ? std::string() : " (status " + f.status + ")") +
+              ": " + f.summary;
+        out.rejected = true;
         return false;
     }
+    // xbox.com handleSdpAnswer only accepts status "success"; an absent status is tolerated.
+    if (!f.status.empty() && f.status != "success") {
+        err = "sdp exchange: status " + f.status + ": " + f.summary;
+        out.rejected = true;
+        return false;
+    }
+    XC_LOGI("sdp exchange fields: %s", f.summary.c_str());
     // Keep the answer verbatim (CRLF intact) — re-serialising corrupted ice-ufrag/pwd (green-nx).
-    answerSdp = sdpIt->get<std::string>();
+    out.sdp = std::move(f.sdp);
+    out.chat = f.chat;
+    out.chatStream = f.chatStream;
+    out.summary = std::move(f.summary);
     ready = true;
     return true;
 }
