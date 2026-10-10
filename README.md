@@ -30,8 +30,8 @@ to your TV with a DualSense as the controller.
 | Cloud library (Game Pass, owned, free-to-play), filters, box art | ✅ works on PS5 |
 | Queue / waiting for a server | ✅ works on PS5 |
 | Cloud streaming (video, audio, controller, rumble) | ✅ works on PS5 |
-| Remote play of your own Xbox console (xHome) | ⚠️ implemented, not tested |
-| Voice chat (headset mic, party/game chat) | ⚠️ implemented, needs hardware testing |
+| Remote play of your own Xbox console (xHome) | ✅ works on PS5 |
+| Voice chat (headset mic, party/game chat) | ✅ works on PS5 |
 | Native PS5 title / home-screen tile | ❌ not supported (start it from the websrv launcher) |
 
 Video is decoded in software (FFmpeg). If the picture stutters, set the resolution to 720p.
